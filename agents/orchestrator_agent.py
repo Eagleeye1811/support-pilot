@@ -11,28 +11,24 @@ from __future__ import annotations
 import re
 import time
 
-from . import channel_agent, context_agent, intent_agent, memory_agent, response_agent, satisfaction_agent
-from .mcp_bus import get_bus
-from .shared_agent import ALWAYS_ESCALATE, AUTO_REFUND_LIMIT, CHANNELS, COMPANY, INTENTS, llm_enabled
-from .tools import TOOLS
+from . import (action_agent, channel_agent, context_agent, email_agent, escalation_agent, intent_agent, knowledge_agent, media,
+               memory_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent, troubleshooting_agent)
+from .shared_agent import ALWAYS_ESCALATE, AUTO_REFUND_LIMIT, CHANNELS, COMPANY, INTENTS
 
 
 class Tracer:
-    """Records every step of a turn; agent steps are MCP tool calls made through the bus."""
-
-    def __init__(self, bus=None):
-        self.bus = bus
+    def __init__(self):
         self.steps = []
 
-    def tool(self, agent, name, args, summarize=lambda r: ""):
+    def run(self, agent, fn, summarize=lambda r: ""):
         t0 = time.time()
         try:
-            result, rec = self.bus.call(name, args)
+            result = fn()
+            status = "OK"
         except Exception as exc:
-            self.steps.append(dict(agent=agent, status="ERROR", ms=round((time.time() - t0) * 1000, 1), summary=str(exc)[:300],
-                                   tool=name, transport=self.bus.transport))
+            self.steps.append(dict(agent=agent, status="ERROR", ms=round((time.time() - t0) * 1000, 1), summary=str(exc)))
             raise
-        self.steps.append(dict(rec, agent=agent, status="OK", summary=summarize(result)))
+        self.steps.append(dict(agent=agent, status=status, ms=round((time.time() - t0) * 1000, 1), summary=summarize(result)))
         return result
 
     def note(self, agent, summary, status="OK"):
@@ -69,52 +65,43 @@ def _issue_understanding(understanding, issue, mode):
 
 
 def handle_message(store, text=None, conversation_id=None, customer_id=None, channel="web", payload=None, use_llm=True,
-                   attachments=None, contact_email=None):
-    """Process one inbound customer message end-to-end and return the full, traceable turn.
+                   contact_email=None):
+    """Process one inbound customer message end-to-end and return the full, traceable turn."""
+    T = Tracer()
+    plan = ["channel", "understand", "memory", "context", "knowledge", "troubleshoot", "escalate?", "act", "escalate",
+            "ticket", "track", "respond", "csat", "review"]
+    T.note("Master Orchestrator (Planner)", "Plan: " + " → ".join(plan))
 
-    Every agent runs as an MCP tool call (see ``mcp_bus.py``); the trace records each call.
-    """
-    bus = get_bus(store)
-    T = Tracer(bus)
-    attachments = list(attachments or [])
-    T.note("Master Orchestrator (Planner)", f"MCP client · {bus.transport} · plan: understand → memory → context → knowledge "
-           "→ troubleshoot → decide → act → ticket → track → media → email → reply → review")
-
-    inbound = T.tool("0 Omnichannel Adapter", "normalize_channel",
-                     dict(channel=channel, payload=payload if payload is not None else {"text": text}),
-                     lambda r: f"{CHANNELS.get(r['channel'], r['channel'])} · sender {r['sender'] or 'session'}")
+    inbound = T.run("0 Omnichannel Adapter",
+                    lambda: channel_agent.normalize_inbound(channel, payload if payload is not None else {"text": text}),
+                    lambda r: f"{CHANNELS.get(r['channel'], r['channel'])} · sender {r['sender'] or 'session'}")
     text = inbound["text"]
     if not text:
         raise ValueError("Empty message")
     conv = memory_agent.load_conversation(store, conversation_id, customer_id or inbound["sender"].get("customer_id"), inbound["channel"])
     conv["channel"] = inbound["channel"]
-    if contact_email:
+    if contact_email:  # an address the customer gave us: the Email agent sends ticket emails there
         conv["contact_email"] = contact_email
-    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"], attachments=attachments))
-    out = dict(conversation_id=conv["id"], channel=inbound["channel"], inbound=inbound, text=text, attachments=attachments,
-               understanding=None, issue=None, mode=None, context=None, articles=[], workflow=None, investigation=None,
-               actions=[], decision=None, pre_decision=None, ticket=None, review=None, llm_polished=False, media=[], email=None)
+    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"]))
+    out = dict(conversation_id=conv["id"], channel=inbound["channel"], inbound=inbound, understanding=None, issue=None,
+               mode=None, context=None, articles=[], workflow=None, investigation=None, actions=[], decision=None,
+               pre_decision=None, ticket=None, review=None, llm_polished=False, email=None)
 
     def finish(reply, ctx=None, decision=None, ticket=None, intent=None, actions=()):
         polished = False
-        if use_llm and decision in ("auto_resolve", "escalate") and llm_enabled():
-            p = T.tool("Response Composer", "polish_reply",
-                       dict(reply=reply, emotion=(out.get("understanding") or {}).get("emotion", "calm")),
-                       lambda r: "LLM polish accepted" if r["polished"] else "kept the deterministic wording")
-            reply, polished = p["reply"], p["polished"]
-        rv = T.tool("Reviewer (guardrail)", "review_reply",
-                    dict(reply=reply, decision=decision, actions=list(actions), ticket=ticket, intent=intent, context=ctx),
-                    lambda r: "approved" if r["approved"] else "rejected: " + ", ".join(r["rejected"]))
+        if use_llm and decision in ("auto_resolve", "escalate"):
+            reply, polished = response_agent.polish(reply, (out.get("understanding") or {}).get("emotion", "calm"))
+        rv = T.run("Reviewer (guardrail)", lambda: review(reply, decision, list(actions), ticket, intent, ctx),
+                   lambda r: "approved" if r["approved"] else "rejected: " + ", ".join(r["rejected"]))
         if not rv["approved"]:
             reply = ("I want to make sure this is handled correctly, so I've passed your request to a specialist who will "
                      "contact you shortly." + (f" Your reference is {ticket['id']}." if ticket else ""))
-        memory_agent.add_message(conv, "assistant", reply, dict(ticket_id=(ticket or {}).get("id"), decision=decision,
-                                                                media=[m["sku"] for m in out["media"]]))
+        memory_agent.add_message(conv, "assistant", reply, dict(ticket_id=(ticket or {}).get("id"), decision=decision))
         memory_agent.save(store, conv)
         out.update(reply=reply, reply_channel=channel_agent.format_outbound(
             conv["channel"], reply, (ctx or {}).get("first_name"), (ticket or {}).get("id"),
             (out.get("issue") or {}).get("label")), review=rv, trace=T.steps, llm_polished=polished,
-            awaiting=conv.get("awaiting"), conversation=conv, transport=bus.transport)
+            awaiting=conv.get("awaiting"), conversation=conv)
         return out
 
     # ---- CSAT reply ----------------------------------------------------------
@@ -122,10 +109,11 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
         rating, comment = satisfaction_agent.parse_rating(text)
         if rating:
             tid = conv.get("awaiting_ticket")
-            rec = T.tool("10 Customer Satisfaction", "record_csat",
-                         dict(ticket_id=tid, rating=rating, comment=comment, conversation_id=conv["id"]),
-                         lambda r: f"CSAT {r['rating']}/5 · quality {r['resolution_quality']}")
+            rec = T.run("10 Customer Satisfaction", lambda: satisfaction_agent.record_csat(store, tid, rating, comment, conv["id"]),
+                        lambda r: f"CSAT {r['rating']}/5 · quality {r['resolution_quality']}")
             t = store.get("tickets", tid)
+            if t and t["status"] == "Resolved":
+                tracking_agent.transition(store, t, "Closed", actor="Customer", note="Customer confirmed via CSAT", notify=False)
             conv["awaiting"] = None
             if conv.get("active_issue"):
                 memory_agent.set_status(conv["active_issue"], "closed", f"CSAT {rating}/5")
@@ -137,33 +125,21 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
             return finish(reply, ctx, decision="csat", ticket=t)
 
     # ---- 1 understand + 6 memory ----------------------------------------------
-    understanding = T.tool("1 Conversation Understanding", "understand_message", dict(text=text, use_llm=use_llm),
-                           lambda r: f"{r['intent']} · {r['category']} · {r['priority']} · {r['emotion']} · conf {r['confidence']:.0%}")
+    understanding = T.run("1 Conversation Understanding", lambda: intent_agent.understand(text, use_llm),
+                          lambda r: f"{r['intent']} · {r['category']} · {r['priority']} · {r['emotion']} · conf {r['confidence']:.0%}")
     out["understanding"] = understanding
     conv["sentiment_trail"].append(understanding["emotion"])
-
-    def memory(force_new=False):
-        res = T.tool("6 Conversation Memory", "track_conversation",
-                     dict(conv=conv, understanding=understanding, text=text, force_new=force_new),
-                     lambda r: f"{r['mode']} · issue {(r['conv'].get('active_issue') or {}).get('intent', '—') if r['has_issue'] else '—'}"
-                               f" · turn {len(r['conv']['messages'])}")
-        conv.clear()
-        conv.update(res["conv"])  # keep the same dict object, re-bound to the tool's result
-        return (conv["active_issue"] if res["has_issue"] else None), res["mode"]
-
-    issue, mode = memory()
+    issue, mode = T.run("6 Conversation Memory", lambda: memory_agent.track_issue(conv, understanding, text),
+                        lambda r: f"{r[1]} · issue {r[0]['intent'] if r[0] else '—'} · turn {len(conv['messages'])}")
     out.update(issue=issue, mode=mode)
 
     # ---- 2 customer context ---------------------------------------------------
     ents = dict((issue or {}).get("slots", {}), **understanding["entities"])
-    cres = T.tool("2 Customer Context", "customer_context",
-                  dict(customer_id=conv.get("customer_id"), entities=ents, sender=inbound["sender"]),
-                  lambda r: ((r["context"]["headline"] + (f" (identified by {r['method']})" if r["method"] and r["method"] != "session" else ""))
-                             if r["context"] else "customer not identified"))
-    if cres["customer_id"] and not conv.get("customer_id"):
-        conv["customer_id"] = cres["customer_id"]
-    ctx = cres["context"] if conv.get("customer_id") == cres["customer_id"] else \
-        context_agent.customer_context(store, conv.get("customer_id"))
+    cid, method = context_agent.resolve_customer_id(store, conv.get("customer_id"), ents, inbound["sender"])
+    if cid and conv.get("customer_id") != cid and not conv.get("customer_id"):
+        conv["customer_id"] = cid
+    ctx = T.run("2 Customer Context", lambda: context_agent.customer_context(store, conv.get("customer_id")),
+                lambda r: (r["headline"] + (f" (identified by {method})" if method and method != "session" else "")) if r else "customer not identified")
     out["context"] = ctx
 
     intent = understanding["intent"]
@@ -183,25 +159,25 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
         if intent == "ticket_status":
             if not ctx:
                 return finish(response_agent.SLOT_QUESTIONS["customer_identity"], ctx)
-            st = T.tool("9 Resolution Tracking", "ticket_status",
-                        dict(customer_id=ctx["customer_id"], ticket_id=understanding["entities"].get("ticket_id")),
-                        lambda r: f"status of {r['ticket']['id']}" if r["ticket"] else "no open ticket")
-            return finish(st["message"], ctx, ticket=st["ticket"])
+            t, msg = T.run("9 Resolution Tracking", lambda: tracking_agent.status_reply(store, ctx["customer_id"], understanding["entities"].get("ticket_id")),
+                           lambda r: f"status of {r[0]['id']}" if r[0] else "no open ticket")
+            return finish(msg, ctx, ticket=t)
         if intent == "human_agent" and issue is None:
-            issue, mode = memory(force_new=True)
+            issue = memory_agent.open_issue(conv, understanding, text)
             out.update(issue=issue, mode="new")
     human_requested = intent == "human_agent"
     if issue is None:
-        issue, mode = memory(force_new=True)
+        issue = memory_agent.open_issue(conv, understanding, text)
         out.update(issue=issue, mode="new")
     iu = _issue_understanding(understanding, issue, mode)
     memory_agent.set_status(issue, "investigating")
 
     # ---- 3 knowledge ----------------------------------------------------------------
-    kres = T.tool("3 Knowledge Retrieval", "search_knowledge",
-                  dict(query=f"{issue.get('first_message') or ''} {text}", intent=issue["intent"], category=issue["category"], top_k=4),
-                  lambda r: ", ".join(f"{a['id']} ({a['relevance']:.0%})" for a in r["articles"][:3]) or "no match")
-    articles, workflow = kres["articles"], kres["workflow"]
+    query = f"{issue.get('first_message') or ''} {text}"
+    articles = T.run("3 Knowledge Retrieval", lambda: knowledge_agent.search(query, issue["intent"], issue["category"], 4, store),
+                     lambda r: ", ".join(f"{a['id']} ({a['relevance']:.0%})" for a in r[:3]) or "no match")
+    workflow = knowledge_agent.select_workflow(issue["intent"], articles)
+    kb_conf = knowledge_agent.kb_confidence(articles, issue["intent"])
     out.update(articles=articles, workflow=workflow)
 
     # ---- 4 troubleshooting --------------------------------------------------------
@@ -211,86 +187,78 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
                              diagnosis="Customer requested a human agent.", resolvable=False, confidence=0.9,
                              recommended_actions=[], missing_slots=[], team="Tier-1 Support", facts={})
     else:
-        investigation = T.tool("4 Troubleshooting", "troubleshoot",
-                               dict(intent=issue["intent"], context=ctx, slots=issue["slots"], articles=articles,
-                                    kb_confidence=kres["kb_confidence"], attachments=attachments),
-                               lambda r: f"{len(r['steps'])} checks · {r['diagnosis'][:90]} · conf {r['confidence']:.0%}")
-        issue["slots"].update(investigation.get("slots") or {})
+        investigation = T.run("4 Troubleshooting", lambda: troubleshooting_agent.investigate(store, issue["intent"], ctx, issue["slots"], articles, kb_conf=kb_conf),
+                              lambda r: f"{len(r['steps'])} checks · {r['diagnosis'][:90]} · conf {r['confidence']:.0%}")
     out["investigation"] = investigation
 
     # ---- 7 escalation (pre) → 5 actions → 7 escalation (post) ------------------------
-    def decide(actions=None, label="7 Escalation Decision (pre-action)", summary=None):
-        return T.tool(label, "decide_escalation",
-                      dict(understanding=iu, investigation=investigation, context=ctx, issue=issue, actions=actions,
-                           human_requested=human_requested, clarification_count=conv.get("clarification_count", 0)),
-                      summary or (lambda r: f"{r['decision']} · conf {r['confidence']:.0%} vs threshold {r['threshold']:.0%}"))
-
-    pre = decide()
+    thresholds = satisfaction_agent.learned_thresholds(store)
+    pre = T.run("7 Escalation Decision (pre-action)", lambda: escalation_agent.decide(
+        iu, investigation, ctx, issue, None, thresholds, human_requested, conv.get("clarification_count", 0)),
+        lambda r: f"{r['decision']} · conf {r['confidence']:.0%} vs threshold {r['threshold']:.0%}")
     out["pre_decision"] = pre
     planned = investigation["recommended_actions"] if pre["decision"] == "auto_resolve" else (
         [a for a in investigation["recommended_actions"] if a.get("protective")] if pre["decision"] == "escalate" else [])
     actions = []
     if planned:
-        actions = T.tool("5 Action Execution", "execute_actions",
-                         dict(actions=[dict(action=a["action"], params=a["params"]) for a in planned], context=ctx,
-                              conversation_id=conv["id"]),
-                         lambda r: ", ".join(f"{a['label']}={a['status']}" for a in r))
+        def run_actions():
+            done = []
+            for a in planned:
+                done += action_agent.execute(store, a["action"], a["params"], ctx, conversation_id=conv["id"])
+            return done
+        actions = T.run("5 Action Execution", run_actions,
+                        lambda r: ", ".join(f"{a['label']}={a['status']}" for a in r))
     decision = pre
     if actions:
-        decision = decide(actions, "7 Escalation Decision (post-action)",
-                          lambda r: f"{r['decision']}" + (" · escalated after failed action" if r["decision"] != pre["decision"] else ""))
+        decision = T.run("7 Escalation Decision (post-action)", lambda: escalation_agent.decide(
+            iu, investigation, ctx, issue, actions, thresholds, human_requested, conv.get("clarification_count", 0)),
+            lambda r: f"{r['decision']}" + (" · escalated after failed action" if r["decision"] != pre["decision"] else ""))
     out.update(actions=actions, decision=decision)
-
-    def reply_for(ticket):
-        return T.tool("Response Composer", "compose_reply",
-                      dict(decision=decision, understanding=iu, investigation=investigation, actions=actions, context=ctx,
-                           ticket=ticket, issue=issue, articles=articles, channel=conv["channel"]),
-                      lambda r: f"{len(r['reply'])} chars · tone for {iu.get('emotion', 'calm')} customer")["reply"]
 
     # ---- clarify ----------------------------------------------------------------------
     if decision["decision"] == "clarify":
         conv["clarification_count"] = conv.get("clarification_count", 0) + 1
         issue["missing_slots"] = investigation["missing_slots"]
         memory_agent.set_status(issue, "awaiting_customer", "Asked for " + ", ".join(investigation["missing_slots"]))
-        return finish(reply_for(None), ctx, decision="clarify", intent=issue["intent"], actions=actions)
+        reply = response_agent.compose(decision, iu, investigation, actions, ctx, None, issue, articles, conv["channel"])
+        return finish(reply, ctx, decision="clarify", intent=issue["intent"], actions=actions)
     issue["missing_slots"] = []
 
     # ---- 8 ticket + 9 tracking -----------------------------------------------------------
     summary = memory_agent.summarize(conv, issue, investigation, actions)
-    ticket = T.tool("8 Ticket Generation", "create_ticket",
-                    dict(conv=conv, issue=issue, understanding=iu, context=ctx, investigation=investigation, actions=actions,
-                         decision=decision, summary=summary, articles=articles, attachments=attachments),
-                    lambda r: f"{r['id']} · {r['status']} · {r['team']} · {r['priority']}")
-    issue["ticket_id"] = ticket["id"]
+    ticket = T.run("8 Ticket Generation", lambda: ticket_agent.create_or_update(store, conv, issue, iu, ctx, investigation, actions,
+                                                                                 decision, summary, articles),
+                   lambda r: f"{r['id']} · {r['status']} · {r['team']} · {r['priority']}")
     for a in actions:
         a["ticket_id"] = ticket["id"]
-    tr = T.tool("9 Resolution Tracking", "track_resolution",
-                dict(ticket_id=ticket["id"], decision=decision["decision"], actions=actions, context=ctx,
-                     channel=conv["channel"], conversation_id=conv["id"]),
-                lambda r: f"{r['ticket_id']} {r['status']} · SLA {r['sla'].get('state')}")
-    if decision["decision"] == "auto_resolve":
-        memory_agent.set_status(issue, "resolved", investigation["diagnosis"])
-        conv["awaiting"], conv["awaiting_ticket"] = "csat", ticket["id"]
-    else:
-        memory_agent.set_status(issue, "escalated", f"{ticket['id']} → {ticket['team']}")
-    out["ticket"] = store.get("tickets", ticket["id"]) or ticket
-    out["tracking"] = tr
+        store.put("actions", a["id"], a)
 
-    # ---- media + email ------------------------------------------------------------------
-    if "select_media" in TOOLS:
-        out["media"] = T.tool("Media Agent", "select_media",
-                              dict(intent=issue["intent"], investigation=investigation, context=ctx, slots=issue["slots"]),
-                              lambda r: ", ".join(f"{m['role']}: {m['name']}" for m in r) or "no product images")
-    reply = reply_for(out["ticket"])
+    def track():
+        sla = tracking_agent.sla_status(ticket)
+        if decision["decision"] == "auto_resolve":
+            msgs = [a["customer_message"] for a in actions if a["status"] == "success" and a.get("customer_message")]
+            if msgs and ctx:
+                action_agent.execute(store, "notify_customer", dict(customer_id=ctx["customer_id"], channel=conv["channel"],
+                                     ticket_id=ticket["id"], message=f"{ticket['id']} resolved: " + " ".join(msgs), kind="resolution"),
+                                     ctx, conversation_id=conv["id"])
+            memory_agent.set_status(issue, "resolved", investigation["diagnosis"])
+            conv["awaiting"], conv["awaiting_ticket"] = "csat", ticket["id"]
+        else:
+            memory_agent.set_status(issue, "escalated", f"{ticket['id']} → {ticket['team']}")
+        return sla
+    T.run("9 Resolution Tracking", track, lambda r: f"lifecycle {issue['status']} · SLA {r.get('state')}")
+    out["ticket"] = ticket
+
+    reply = response_agent.compose(decision, iu, investigation, actions, ctx, ticket, issue, articles, conv["channel"])
     if decision["decision"] == "auto_resolve":
         T.note("10 Customer Satisfaction", "CSAT requested")
         reply += "\n\n" + satisfaction_agent.CSAT_PROMPT
-    if "send_email" in TOOLS and conv.get("contact_email"):
-        out["email"] = T.tool("Email Agent", "send_email",
-                              dict(to=conv["contact_email"], kind="ticket", ticket_id=ticket["id"], reply=reply,
-                                   media=[m["sku"] for m in out["media"]], customer_name=(ctx or {}).get("first_name")),
-                              lambda r: f"{r['status']} → {r['to_masked']}")
-    return finish(reply, ctx, decision=decision["decision"], ticket=out["ticket"], intent=issue["intent"], actions=actions)
+    if conv.get("contact_email"):
+        out["email"] = T.run("Email Agent", lambda: email_agent.send_email(
+            store, conv["contact_email"], "ticket", ticket["id"], reply,
+            images=media.ticket_images(store, issue["intent"], issue.get("slots")), customer_name=(ctx or {}).get("first_name")),
+            lambda r: f"{r['status']} → {r['to_masked']}")
+    return finish(reply, ctx, decision=decision["decision"], ticket=ticket, intent=issue["intent"], actions=actions)
 
 
 def run_conversation(store, messages, customer_id=None, channel="web", use_llm=False):

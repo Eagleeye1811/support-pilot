@@ -14,11 +14,9 @@ import smtplib
 import ssl
 from datetime import timedelta
 from email.message import EmailMessage
-from typing import Optional
 
 from .media import product_image_bytes
 from .shared_agent import COMPANY, PRODUCT, get_secret, iso, now, parse_ts
-from .tools import register
 
 RATE_LIMIT = 5
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
@@ -130,16 +128,14 @@ def _log(store, **fields):
     return rec
 
 
-def send_email(store, to: str, kind: str = "ticket", ticket_id: Optional[str] = None, reply: str = "", message: str = "",
-               media: Optional[list[str]] = None, customer_name: Optional[str] = None) -> dict:
-    """Email Agent: send a real email (ticket confirmation or status update) to the address the customer gave us."""
+def send_email(store, to, kind="ticket", ticket_id=None, reply="", message="", images=None, customer_name=None):
+    """Email Agent: send a real email (ticket confirmation or status update) to the address the customer gave us.
+
+    `images` is a list of {sku, name, role} (see media.ticket_images); they are embedded inline.
+    """
     to = (to or "").strip().lower()
     ticket = store.get("tickets", ticket_id) if ticket_id else None
-    picks = []
-    for sku in media or []:
-        p = next((dict(sku=sku, name=i["name"], role=r) for r, i in _roles(store, ticket, sku)), None)
-        if p and product_image_bytes(sku):
-            picks.append(p)
+    picks = [p for p in (images or []) if product_image_bytes(p["sku"])]
     subject, text_body, html_body = render(kind, ticket, reply, message, customer_name, picks)
     base = dict(to=to, to_masked=mask(to), kind=kind, ticket_id=ticket_id, subject=subject, html=html_body, text=text_body,
                 media=[p["sku"] for p in picks])
@@ -166,24 +162,3 @@ def send_email(store, to: str, kind: str = "ticket", ticket_id: Optional[str] = 
     except Exception as exc:
         return _log(store, status="failed", error=f"{type(exc).__name__}: {exc}"[:300], **base)
     return _log(store, status="sent", **base)
-
-
-def _roles(store, ticket, sku):
-    """Find the product name and its role (Ordered / Received / Your order) for an image SKU."""
-    order = store.get("orders", ((ticket or {}).get("slots") or {}).get("order_id", "")) if ticket else None
-    out = []
-    if order:
-        for i in order.get("items", []):
-            if i["sku"] == sku:
-                out.append(("Ordered" if ticket.get("intent") == "wrong_item" else "Your order", i))
-        for i in order.get("delivered_items", []):
-            if i["sku"] == sku and ticket.get("intent") == "wrong_item":
-                out.append(("Received", i))
-    if not out:
-        p = store.get("inventory", sku)
-        if p:
-            out.append(("Product", dict(sku=sku, name=p["name"])))
-    return out
-
-
-register("send_email", send_email, "Email Agent")

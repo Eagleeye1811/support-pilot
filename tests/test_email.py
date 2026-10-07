@@ -43,7 +43,7 @@ def test_ticket_email_is_sent_with_product_images(smtp):
     r = A.handle_message(store, "I received the wrong item", customer_id="CUST1001", use_llm=False,
                          contact_email="asha.k@gmail.com")
     assert r["email"]["status"] == "sent" and r["email"]["to_masked"] == "a***@gmail.com"
-    assert any(s.get("tool") == "send_email" and s["transport"] == "mcp" for s in r["trace"])
+    assert any(s["agent"] == "Email Agent" for s in r["trace"])
     msg = smtp[-1]
     assert msg["To"] == "asha.k@gmail.com" and r["ticket"]["id"] in msg["Subject"]
     images = [p for p in msg.walk() if p.get_content_type() == "image/png"]
@@ -52,9 +52,12 @@ def test_ticket_email_is_sent_with_product_images(smtp):
     assert "cid:EL-200" in html and "rate this support experience" not in html.lower()
 
 
+def test_no_email_without_an_address(smtp):
+    r = A.handle_message(A.Store(":memory:"), "I received the wrong item", customer_id="CUST1001", use_llm=False)
+    assert r["email"] is None and not smtp
+
+
 def test_not_configured_is_logged_not_sent(monkeypatch):
-    monkeypatch.delenv("SMTP_USER", raising=False)
-    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
     monkeypatch.setattr(email_agent, "get_secret", lambda name, default=None: default)
     store = A.Store(":memory:")
     rec = email_agent.send_email(store, "asha.k@gmail.com", kind="update", message="Your ticket was resolved")
