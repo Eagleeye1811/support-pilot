@@ -33,7 +33,24 @@ wording — the polished reply is rejected unless every id, amount and date surv
 ## Deploy on Streamlit Community Cloud
 1. Push this folder to a new GitHub repo.
 2. New app → main file `app.py` → Advanced settings → Python 3.11+.
-3. (Optional) add `GROQ_API_KEY` under *Secrets*.
+3. (Optional) add `GROQ_API_KEY` and `TELEGRAM_BOT_TOKEN` under *Secrets*.
+
+## Real Telegram bot
+Customers can talk to SupportPilot from the Telegram app on their phone; the website shows the conversation and
+the agents' flow live in the **Telegram live** tab.
+1. In Telegram open **@BotFather** → `/newbot` → pick a name and a username ending in `bot` → copy the token.
+2. Set `TELEGRAM_BOT_TOKEN` in Streamlit *Secrets* (or `.env` locally) and restart the app.
+3. Open the bot on your phone → **Start** → pick a demo customer (or continue as guest) → describe the issue.
+
+How it works: `telegram_bot.py` long-polls the Bot API on a background thread inside the Streamlit server
+(no webhook or public URL needed), runs each message through the same orchestrator with `channel="telegram"`,
+replies in the chat (⭐ buttons for CSAT) and stores every turn for the website. Ticket updates a human agent makes
+in the **Tickets** tab are pushed back to the customer's chat. Commands: `/start`, `/login`, `/guest`, `/new`, `/help`.
+Run it on its own with `python telegram_bot.py` (share the database via `SUPPORTPILOT_DB`).
+
+Notes: only one copy of the bot may poll a token at a time — stop the local app while the cloud app is running, or
+use a second bot for local testing. Streamlit Cloud puts idle apps to sleep; while it sleeps the bot does not answer
+until someone opens the website. Telegram messages are visible to anyone who can open the site.
 
 ## How each PS-04 component is implemented (`agents/`)
 | # | Agent (PS) | Module | What it really does |
@@ -119,7 +136,9 @@ add real, unseen customer messages for an honest benchmark.
 
 ## Project structure
 ```
-app.py                  Streamlit UI (chat, agent trace, tickets workspace, supervisor dashboard, KB, omnichannel, architecture)
+telegram_bot.py         real Telegram channel (long polling) feeding the Telegram live tab
+agent_flow.py           live agent-flow board (replays each turn stage by stage)
+app.py                  Streamlit UI (chat, Telegram live, agent trace, tickets workspace, supervisor dashboard, KB, omnichannel, architecture)
 mcp_server.py           MCP server (stdio / streamable HTTP)
 agents/                 one module per agent + shared_agent.py (taxonomy, SLA, LLM) + store.py (SQLite)
 data/generate_data.py   synthetic support world

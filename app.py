@@ -6,6 +6,7 @@ import streamlit as st
 
 import agents as A
 from agent_flow import render_flow
+from telegram_bot import start_in_background as start_telegram
 from agents.shared_agent import fmt_ts, humanize_minutes
 
 st.set_page_config(page_title="SupportPilot - Agentic Customer Support", page_icon=":material/support_agent:", layout="wide")
@@ -69,6 +70,10 @@ def get_store():
 
 
 store = get_store()
+
+
+# one long-polling bot per server process (start_telegram de-duplicates); None until TELEGRAM_BOT_TOKEN is set
+tg_bot = start_telegram(store, use_llm=A.llm_enabled())
 ss = st.session_state
 ss.setdefault("conv_id", None)
 ss.setdefault("customer_id", None)
@@ -156,7 +161,7 @@ st.markdown('<div class="sp-subtitle">Understand → gather context → investig
 if error:
     st.error(error)
 
-tabs = st.tabs([":material/forum: Customer chat", ":material/account_tree: Agent trace", ":material/confirmation_number: Tickets",
+tabs = st.tabs([":material/forum: Customer chat", ":material/send: Telegram live", ":material/account_tree: Agent trace", ":material/confirmation_number: Tickets",
                 ":material/monitoring: Supervisor dashboard", ":material/menu_book: Knowledge base", ":material/hub: Omnichannel",
                 ":material/schema: Architecture & MCP"])
 
@@ -262,6 +267,79 @@ with tabs[0]:
                     with st.expander(f"Reply as delivered on {A.CHANNELS[ss.channel]}"):
                         st.code(last["reply_channel"], language=None, wrap_lines=True)
 
+# ---- Telegram live -------------------------------------------------------------------------------------
+TG_SETUP = """
+**Connect a real Telegram bot (≈2 minutes):**
+1. In Telegram, open **@BotFather** → send `/newbot` → choose a name and a username ending in `bot`.
+2. Copy the token BotFather gives you.
+3. Add it to this app's secrets — Streamlit Cloud: *⋮ → Settings → Secrets*; locally: `.env`:
+   ```toml
+   TELEGRAM_BOT_TOKEN = "123456:ABC..."
+   ```
+4. Restart the app, open your bot on your phone and press **Start**.
+"""
+
+
+@st.fragment(run_every="3s")
+def telegram_live():
+    if not tg_bot:
+        st.info("No Telegram bot connected yet.", icon=":material/link_off:")
+        st.markdown(TG_SETUP)
+        return
+    status = store.get("meta", "telegram") or {}
+    user = status.get("username") or tg_bot.username
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if status.get("running") and user:
+            st.badge(f"Connected · @{user}", icon=":material/check_circle:", color="green")
+            st.link_button("Open bot in Telegram", f"https://t.me/{user}", icon=":material/open_in_new:")
+        else:
+            st.badge("Connecting…" if not status.get("error") else "Not connected", color="orange")
+        if status.get("last_poll"):
+            st.caption(f"Last checked {fmt_ts(status['last_poll'])} · refreshes every 3 s")
+    if status.get("error"):
+        st.caption(f"⚠️ Last error: {status['error']}")
+    chats = sorted(store.list("telegram_chats"), key=lambda c: c.get("updated_at", ""), reverse=True)
+    if not chats:
+        st.info(f"Open **t.me/{user or 'your_bot'}** on your phone, press **Start** and describe an issue — "
+                "the conversation and the agents' work appear here live.", icon=":material/smartphone:")
+        return
+    st.caption("Messages shown here are visible to anyone who opens this website.")
+
+    def chat_label(c):
+        who = (store.get("customers", c["customer_id"]) or {}).get("name") if c.get("customer_id") else "guest"
+        return f"{c.get('first_name', 'Telegram user')} (as {who})"
+
+    left, right = st.columns([1, 1.15], gap="large")
+    with left:
+        chat = st.selectbox("Telegram chat", chats, format_func=chat_label)
+        conv = store.get("conversations", chat["conv_id"]) if chat.get("conv_id") else None
+        box = st.container(height=560, border=True)
+        with box:
+            msgs = (conv or {}).get("messages", [])
+            if not msgs:
+                st.caption("Waiting for the first message from this chat…")
+            for m in msgs:
+                with st.chat_message("user" if m["role"] == "user" else "assistant",
+                                     avatar=":material/smartphone:" if m["role"] == "user" else ":material/support_agent:"):
+                    st.markdown(m["text"])
+                    tid = (m.get("meta") or {}).get("ticket_id")
+                    if tid and m["role"] == "assistant":
+                        st.caption(f"🎫 {tid} · {(m['meta'] or {}).get('decision') or ''}")
+    with right:
+        turns = sorted(store.list("telegram_turns", chat_id=chat["chat_id"]), key=lambda t: t["seq"])
+        if not turns:
+            st.info("The agents' live flow appears here after the next message.", icon=":material/psychology:")
+            return
+        # no widget key: when a new message arrives the options change and the newest turn is selected again
+        turn = st.selectbox("Message", turns[::-1], format_func=lambda t: f"{fmt_ts(t['ts'])} · {t['text'][:60]}")
+        st.markdown('<div class="sp-card-title">Live agent flow</div>', unsafe_allow_html=True)
+        render_flow(turn["text"], turn["result"], theme=THEME, height=700)
+
+
+with tabs[1]:
+    telegram_live()
+
+
 # ---- 2 trace -------------------------------------------------------------------------------------------
 FLOW = [("0", "Omnichannel\nadapter"), ("1", "Understanding"), ("6", "Memory"), ("2", "Customer\ncontext"), ("3", "Knowledge"),
         ("4", "Troubleshooting"), ("7", "Escalation"), ("5", "Action\nexecution"), ("8", "Ticket"), ("9", "Tracking"),
@@ -284,7 +362,7 @@ def flow_dot(trace):
             'edge [color="#8a8a86"]; ' + " ".join(nodes) + f" {edges}; }}")
 
 
-with tabs[1]:
+with tabs[2]:
     if not ss.turns:
         st.info("Send a message in Customer chat — then pick any turn here to replay how the agents handled it.")
     else:
@@ -311,7 +389,7 @@ with tabs[1]:
             st.json(A.summarize_turn(dict(r, conversation={})), expanded=False)
 
 # ---- 3 tickets -------------------------------------------------------------------------------------------
-with tabs[2]:
+with tabs[3]:
     tickets = store.list("tickets")
     f1, f2, f3, f4 = st.columns([2, 1.3, 1.3, 1])
     statuses = f1.multiselect("Status", A.STATUS_FLOW, default=["Opened", "Assigned", "Pending Customer", "Resolved"])
@@ -374,7 +452,7 @@ with tabs[2]:
                     st.caption(f"{fmt_ts(n['created_at'])} · {A.CHANNELS.get(n['channel'], n['channel'])}: {n['message']}")
 
 # ---- 4 supervisor dashboard ------------------------------------------------------------------------------
-with tabs[3]:
+with tabs[4]:
     m = A.supervisor_metrics(store)
     cs = A.csat_summary(store)
     with st.container(horizontal=True):
@@ -451,7 +529,7 @@ with tabs[3]:
             st.caption(f"{fmt_ts(n['created_at'])} · {n.get('ticket_id') or ''} · {A.CHANNELS.get(n['channel'], n['channel'])}: {n['message']}")
 
 # ---- 5 knowledge base ------------------------------------------------------------------------------------
-with tabs[4]:
+with tabs[5]:
     q1, q2 = st.columns([3, 1])
     query = q1.text_input("Search the knowledge base", "refund for a failed payment")
     intent_f = q2.selectbox("Intent boost", [None] + list(A.INTENTS), format_func=lambda i: "none" if i is None else i)
@@ -475,7 +553,7 @@ with tabs[4]:
                                         Reliability=a["reliability"]) for a in A.load_kb(store)]), hide_index=True, width="stretch")
 
 # ---- 6 omnichannel ---------------------------------------------------------------------------------------
-with tabs[5]:
+with tabs[6]:
     st.caption("Every channel's native payload goes through the same adapter and the same agents — one brain, five channels.")
     oc = st.segmented_control("Channel", list(A.CHANNELS), format_func=lambda c: A.CHANNELS[c], default="whatsapp", key="oc_channel")
     oc = oc or "whatsapp"
@@ -498,7 +576,7 @@ with tabs[5]:
             st.error(f"Invalid JSON: {exc}")
 
 # ---- 7 architecture ----------------------------------------------------------------------------------------
-with tabs[6]:
+with tabs[7]:
     st.graphviz_chart(flow_dot([dict(agent=f"{k} x") for k, _ in FLOW] + [dict(agent="Reviewer")]), width="stretch")
     st.dataframe(pd.DataFrame(A.AGENTS, columns=["#", "Agent", "Module", "Job"]), hide_index=True, width="stretch")
     a1, a2 = st.columns(2, gap="large")
