@@ -41,7 +41,7 @@ from .store import Store, get_store
 from .ticket_agent import render_markdown as render_ticket
 from .tracking_agent import OPEN_STATUSES, STATUS_FLOW, TRANSITIONS, sla_scan, sla_status, supervisor_metrics, transition
 from .troubleshooting_agent import investigate
-from .turns import recent_turns, record_turn
+from .turns import latest_seq, recent_turns, record_turn
 
 AGENTS = [
     ("1", "Conversation Understanding", "intent_agent", "Intent, category, priority, sentiment/emotion, entities"),
@@ -67,7 +67,7 @@ __all__ = [
     "PRODUCT", "SAMPLE_PAYLOADS", "STATUS_FLOW", "TEAMS", "TRANSITIONS", "Store", "action_catalog", "analyze_sentiment",
     "compact_context", "csat_summary", "email_configured", "mask_email_address", "send_email", "customer_context", "daily_volume", "decide_escalation", "detect_incidents",
     "execute_action", "expand_kb", "extract_entities", "fmt_ts", "format_outbound", "get_groq_api_key", "get_store",
-    "handle_message", "inr", "recent_turns", "record_turn", "investigate", "learned_thresholds", "llm_enabled", "load_kb", "normalize_inbound",
+    "handle_message", "inr", "latest_seq", "recent_turns", "record_turn", "investigate", "learned_thresholds", "llm_enabled", "load_kb", "normalize_inbound",
     "record_csat", "render_ticket", "resolve_customer_id", "review", "run_conversation", "search_kb", "select_workflow",
     "sla_scan", "sla_status", "summarize_turn", "supervisor_metrics", "transition", "understand",
 ]

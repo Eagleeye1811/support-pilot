@@ -56,7 +56,7 @@ tg_bot = start_telegram(store, use_llm=A.llm_enabled())  # one long-polling bot 
 THEME = getattr(st.context.theme, "type", None) or "light"
 ss = st.session_state
 
-if not A.recent_turns(store, 1):  # first visit after a (re)start: show a real sample turn instead of an empty stage
+if not A.latest_seq(store):  # first visit after a (re)start: show a real sample turn instead of an empty stage
     A.record_turn(store, "sample", SAMPLE[1], A.handle_message(store, SAMPLE[1], customer_id=SAMPLE[0], use_llm=False))
 
 
@@ -94,8 +94,7 @@ if status.get("error") and tg_bot:
 @st.fragment(run_every="2s")
 def watch_for_new_turns():
     """Cheap poll: rerun the page only when a new turn arrives (from Telegram or the website)."""
-    latest = A.recent_turns(store, 1)
-    seq = latest[-1]["seq"] if latest else 0
+    seq = A.latest_seq(store)  # one counter read — no turn documents are loaded
     if ss.get("latest_seq") is None:
         ss.latest_seq = seq
     elif seq != ss.latest_seq:

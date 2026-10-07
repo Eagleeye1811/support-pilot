@@ -30,7 +30,8 @@ from agents.turns import record_turn
 API = "https://api.telegram.org/bot{token}/{method}"
 FILE_API = "https://api.telegram.org/file/bot{token}/{path}"
 POLL_TIMEOUT = 10  # seconds; also how often website ticket updates are pushed to Telegram
-_RUNNING = {}  # token → bot: one poller per process, or Telegram answers 409 Conflict
+THREAD_NAME = "supportpilot-telegram"
+CONFLICT_BACKOFF = 15  # seconds to wait when another poller holds the token (Telegram 409 Conflict)
 DEMO_CUSTOMERS = ["CUST1001", "CUST1002", "CUST1003", "CUST1005", "CUST1006", "CUST1008", "CUST1009", "CUST1010", "CUST1012"]
 EMAIL_OFFER = "📧 Want a copy of this ticket by email? Just reply with your email address (or say *skip*)."
 HELP = ("Tell me your problem in your own words — orders, payments, refunds, login, subscriptions or internet. "
@@ -222,13 +223,13 @@ class TelegramBot:
         reply = r.get("reply_channel") or r["reply"]
         if r.get("ticket"):
             doc["last_ticket"] = r["ticket"]["id"]
-            if decision_of(r) in ("auto_resolve", "escalate") and not doc.get("contact_email"):
-                reply += "\n\n" + EMAIL_OFFER
-                doc["awaiting_email"] = True
+            if decision_of(r) in ("auto_resolve", "escalate") and not doc.get("contact_email") and not doc.get("email_offered"):
+                reply += "\n\n" + EMAIL_OFFER  # offered once per chat; /email works any time
+                doc.update(awaiting_email=True, email_offered=True)
         self.save_chat(doc)
         # notifications raised during this turn are already covered by the reply
         for n in self.store.list("notifications", where=lambda n: n.get("created_at", "") >= before):
-            self.store.put("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), suppressed=True))
+            self.store.claim("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), suppressed=True))
         record_turn(self.store, "telegram", text, r, chat_id=doc["chat_id"])
         buttons = [[{"text": "⭐" * i, "callback_data": f"csat:{i}"} for i in range(1, 6)]] \
             if r.get("awaiting") == "csat" else None
@@ -288,12 +289,14 @@ class TelegramBot:
                 continue
             t = self.store.get("tickets", n["ticket_id"]) or {}
             chat = chats.get(t.get("conversation_id"))
+            # claim before sending, so a second poller (or a retry) can never deliver the same update twice
+            if not self.store.claim("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), delivered=bool(chat))):
+                continue
             if chat:
                 self.send(chat["chat_id"], f"🔔 Update on {n['ticket_id']}: {n['message']}")
                 if chat.get("contact_email"):
                     self.email_turn(chat, f"Ticket {n['ticket_id']} updated on the website", t, kind="update",
                                     message=n["message"])
-            self.store.put("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), delivered=bool(chat)))
 
     # ---- loop ----------------------------------------------------------------------------------
     def run(self):
@@ -311,15 +314,33 @@ class TelegramBot:
                 updates = self.call("getUpdates", http_timeout=POLL_TIMEOUT + 10, **self._poll_params(offset))
                 for upd in updates:
                     offset = upd["update_id"] + 1
-                    try:
-                        self.handle_update(upd)
-                    except Exception as exc:  # one bad message must not stop the bot
-                        self.status(error=f"{type(exc).__name__}: {exc}")
+                    if self._stop.is_set():
+                        break
+                    self.process(upd)
                 self.deliver_notifications()
-                self.status(running=True, last_poll=iso())
+                self.status(running=True, last_poll=iso(), error=None)
             except Exception as exc:
-                self.status(running=True, error=f"{type(exc).__name__}: {exc}", last_poll=iso())
-                time.sleep(5)
+                if "Conflict" in str(exc):  # another poller holds the token: wait it out instead of fighting
+                    self.status(running=True, last_poll=iso(),
+                                error="Another copy of this bot is polling the same token — waiting for it to stop")
+                    self._stop.wait(CONFLICT_BACKOFF)
+                else:
+                    self.status(running=True, error=f"{type(exc).__name__}: {exc}", last_poll=iso())
+                    self._stop.wait(5)
+        if offset is not None:  # tell Telegram what we handled, so the next poller does not get it again
+            try:
+                self.call("getUpdates", offset=offset, timeout=0)
+            except Exception:
+                pass
+
+    def process(self, upd):
+        """Handle one update exactly once, even if two pollers or a restart see it again."""
+        if not self.store.claim("telegram_updates", upd["update_id"], dict(ts=iso())):
+            return
+        try:
+            self.handle_update(upd)
+        except Exception as exc:  # one bad message must not stop the bot
+            self.status(error=f"{type(exc).__name__}: {exc}")
 
     @staticmethod
     def _poll_params(offset):
@@ -332,17 +353,50 @@ class TelegramBot:
         self._stop.set()
 
 
+def _running_thread(token):
+    """The live bot thread for this token. Found via threading (not a module global), so it survives
+    Streamlit hot-reloading this module when new code is deployed."""
+    for t in threading.enumerate():
+        if t.name == THREAD_NAME and t.is_alive() and getattr(t, "bot_token", None) == token:
+            return t
+    return None
+
+
+def _legacy_threads(token):
+    """Bot threads started by earlier versions of this file (named "telegram-bot", no attributes)."""
+    out = []
+    for t in threading.enumerate():
+        bot = getattr(getattr(t, "_target", None), "__self__", None)
+        if t.name == "telegram-bot" and t.is_alive() and getattr(bot, "token", None) == token and hasattr(bot, "stop"):
+            out.append(t)
+    return out
+
+
 def start_in_background(store, token=None, use_llm=True):
-    """Start the bot on a daemon thread; returns the bot, or None when no token is configured."""
+    """Start the bot on a daemon thread; returns the bot, or None when no token is configured.
+
+    Exactly one poller per process: an existing bot running this code is reused; one running older code
+    (left behind by a hot reload) is asked to stop and the new bot starts polling once it has exited.
+    """
     token = token or get_token()
     if not token:
         return None
-    if token in _RUNNING and _RUNNING[token]["thread"].is_alive():
-        return _RUNNING[token]["bot"]
+    old = _running_thread(token)
+    if old is not None and type(old.bot) is TelegramBot and not old.bot._stop.is_set():
+        return old.bot
+    retiring = ([old] if old is not None else []) + _legacy_threads(token)
+    for t in retiring:
+        t.bot.stop() if hasattr(t, "bot") else t._target.__self__.stop()
     bot = TelegramBot(store, token, use_llm)
-    thread = threading.Thread(target=bot.run, name="telegram-bot", daemon=True)
+
+    def run():
+        for t in retiring:  # let previous pollers finish their last long-poll and hand over
+            t.join(POLL_TIMEOUT + 25)
+        bot.run()
+
+    thread = threading.Thread(target=run, name=THREAD_NAME, daemon=True)
+    thread.bot_token, thread.bot = token, bot
     thread.start()
-    _RUNNING[token] = dict(bot=bot, thread=thread)
     return bot
 
 

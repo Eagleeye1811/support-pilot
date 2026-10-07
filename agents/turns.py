@@ -16,5 +16,15 @@ def record_turn(store, source, text, result, chat_id=None):
     return doc
 
 
+def latest_seq(store):
+    """Sequence number of the newest turn — a single counter read, cheap enough to poll every few seconds."""
+    return store.peek_seq("turn")
+
+
 def recent_turns(store, limit=30, **equals):
-    return sorted(store.list("turns", **equals), key=lambda t: t["seq"])[-limit:]
+    """The newest turns (oldest first). Reads only the documents it needs instead of the whole log."""
+    if equals:
+        return sorted(store.list("turns", **equals), key=lambda t: t["seq"])[-limit:]
+    last = latest_seq(store)
+    docs = (store.get("turns", f"{seq:06d}") for seq in range(max(1, last - limit + 1), last + 1))
+    return [d for d in docs if d]

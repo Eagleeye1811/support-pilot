@@ -148,3 +148,89 @@ def test_guest_question(bot):
     bot.handle_update(message("/guest"))
     bot.handle_update(message("What are the delivery charges for cash on delivery?"))
     assert bot.store.get("telegram_chats", CHAT)["conv_id"]
+
+
+# ---- no duplicate pollers, no duplicate replies --------------------------------------------------
+def test_the_same_update_is_handled_once(bot):
+    upd = {"update_id": 501, **message("/start")}
+    bot.process(upd)
+    bot.process(upd)  # Telegram re-delivers after a restart / a second poller sees it
+    assert len(bot.outbox) == 1
+
+
+def test_two_bots_sharing_a_store_reply_once(bot):
+    twin = FakeBot(bot.store)
+    upd = {"update_id": 502, **message("/start")}
+    bot.process(upd)
+    twin.process(upd)
+    assert len(bot.outbox) + len(twin.outbox) == 1
+
+
+def test_website_update_is_delivered_once_by_two_bots(bot):
+    twin = FakeBot(bot.store)
+    bot.handle_update(button("login:CUST1008"))
+    bot.handle_update(message("There's a ₹18,499 transaction I did not make. Is this fraud?"))
+    tid = bot.store.get("telegram_chats", CHAT)["last_ticket"]
+    A.transition(bot.store, tid, "Resolved", actor="Human Agent", note="Card blocked")
+    bot.deliver_notifications()
+    twin.deliver_notifications()
+    assert sum(t.startswith("🔔") for t in bot.texts() + twin.texts()) == 1
+
+
+def test_email_offer_is_made_once_per_chat(bot):
+    bot.handle_update(button("login:CUST1003"))
+    bot.handle_update(message("I can't login, it says my account is locked"))
+    bot.handle_update(message("skip"))
+    bot.handle_update(message("/new"))
+    bot.handle_update(message("I can't login, it says my account is locked"))
+    assert sum(EMAIL_OFFER in t for t in bot.texts()) == 1
+
+
+def _parked_run(self):
+    self._stop.wait(5)
+
+
+def test_one_poller_per_process_even_after_a_hot_reload(monkeypatch):
+    import importlib
+    import threading
+    import telegram_bot as tb
+    monkeypatch.setattr(tb.TelegramBot, "run", _parked_run)
+    store = A.Store(":memory:")
+    first = tb.start_in_background(store, token="T1")
+    assert tb.start_in_background(store, token="T1") is first  # reused, not duplicated
+
+    reloaded = importlib.reload(tb)  # what Streamlit does when new code is deployed
+    monkeypatch.setattr(reloaded.TelegramBot, "run", _parked_run)
+    second = reloaded.start_in_background(store, token="T1")
+    assert second is not first and first._stop.is_set()  # the old-code poller was told to stop
+    second.stop()
+    alive = [t for t in threading.enumerate() if t.name == reloaded.THREAD_NAME and getattr(t, "bot_token", "") == "T1"]
+    for t in alive:
+        t.join(5)
+
+
+def test_legacy_bot_threads_are_retired(monkeypatch):
+    import threading
+    import telegram_bot as tb
+    monkeypatch.setattr(tb.TelegramBot, "run", _parked_run)
+
+    class OldBot:  # what the previous version left running
+        token = "T2"
+
+        def __init__(self):
+            self._stop = threading.Event()
+
+        def run(self):
+            self._stop.wait(10)
+
+        def stop(self):
+            self._stop.set()
+
+    old = OldBot()
+    legacy = threading.Thread(target=old.run, name="telegram-bot", daemon=True)
+    legacy.start()
+    new = tb.start_in_background(A.Store(":memory:"), token="T2")
+    assert old._stop.is_set()
+    legacy.join(2)
+    assert not legacy.is_alive()
+    new.stop()

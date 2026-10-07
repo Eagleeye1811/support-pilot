@@ -71,6 +71,19 @@ class Store:
         doc.update(fields)
         return self.put(collection, doc_id, doc)
 
+    def claim(self, collection, doc_id, data=None):
+        """Atomically create a document only if it does not exist yet; True for the single caller that wins."""
+        with self._lock, self.conn:
+            cur = self.conn.execute("INSERT OR IGNORE INTO docs (collection, id, data, updated) VALUES (?,?,?,?)",
+                                    (collection, str(doc_id), json.dumps(data or {}, default=str), iso()))
+        return cur.rowcount == 1
+
+    def peek_seq(self, name):
+        """Current value of a counter without incrementing it (0 if unused)."""
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM counters WHERE name=?", (name,)).fetchone()
+        return row[0] if row else 0
+
     def next_seq(self, name, start=1):
         with self._lock, self.conn:
             row = self.conn.execute("SELECT value FROM counters WHERE name=?", (name,)).fetchone()
