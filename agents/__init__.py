@@ -22,12 +22,13 @@ server, evaluation and tests.
 | +  | response_agent            | Sentiment-aware response composition   |
 """
 
-from . import (action_agent, channel_agent, context_agent, escalation_agent, insights_agent, intent_agent, knowledge_agent,
-               memory_agent, orchestrator_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent,
+from . import (action_agent, channel_agent, context_agent, email_agent, escalation_agent, insights_agent, intent_agent, knowledge_agent,
+               media, memory_agent, orchestrator_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent,
                troubleshooting_agent)
 from .action_agent import ACTIONS, catalog as action_catalog, execute as execute_action
 from .channel_agent import SAMPLE_PAYLOADS, format_outbound, normalize_inbound
 from .context_agent import compact as compact_context, customer_context, resolve_customer_id
+from .email_agent import email_configured, mask as mask_email_address, send_email
 from .escalation_agent import decide as decide_escalation
 from .insights_agent import daily_volume, detect_incidents
 from .intent_agent import analyze_sentiment, extract_entities, understand
@@ -40,6 +41,7 @@ from .store import Store, get_store
 from .ticket_agent import render_markdown as render_ticket
 from .tracking_agent import OPEN_STATUSES, STATUS_FLOW, TRANSITIONS, sla_scan, sla_status, supervisor_metrics, transition
 from .troubleshooting_agent import investigate
+from .turns import recent_turns, record_turn
 
 AGENTS = [
     ("1", "Conversation Understanding", "intent_agent", "Intent, category, priority, sentiment/emotion, entities"),
@@ -56,14 +58,16 @@ AGENTS = [
     ("+", "Root Cause Discovery", "insights_agent", "Ticket-spike detection with attribute drill-down"),
     ("+", "Omnichannel Adapter", "channel_agent", "Web, WhatsApp, Email, Telegram, Mobile App"),
     ("+", "Response Composer", "response_agent", "Sentiment-aware, fact-grounded replies (optional LLM polish)"),
+    ("+", "Media Agent", "media", "Product images for replies and emails; customer photo evidence"),
+    ("+", "Email Agent", "email_agent", "Real email over Gmail SMTP: ticket confirmations and status updates"),
 ]
 
 __all__ = [
     "ACTIONS", "AGENTS", "ALWAYS_ESCALATE", "AUTO_REFUND_LIMIT", "CHANNELS", "COMPANY", "INTENTS", "OPEN_STATUSES",
     "PRODUCT", "SAMPLE_PAYLOADS", "STATUS_FLOW", "TEAMS", "TRANSITIONS", "Store", "action_catalog", "analyze_sentiment",
-    "compact_context", "csat_summary", "customer_context", "daily_volume", "decide_escalation", "detect_incidents",
+    "compact_context", "csat_summary", "email_configured", "mask_email_address", "send_email", "customer_context", "daily_volume", "decide_escalation", "detect_incidents",
     "execute_action", "expand_kb", "extract_entities", "fmt_ts", "format_outbound", "get_groq_api_key", "get_store",
-    "handle_message", "inr", "investigate", "learned_thresholds", "llm_enabled", "load_kb", "normalize_inbound",
+    "handle_message", "inr", "recent_turns", "record_turn", "investigate", "learned_thresholds", "llm_enabled", "load_kb", "normalize_inbound",
     "record_csat", "render_ticket", "resolve_customer_id", "review", "run_conversation", "search_kb", "select_workflow",
     "sla_scan", "sla_status", "summarize_turn", "supervisor_metrics", "transition", "understand",
 ]

@@ -63,7 +63,7 @@ Message from Priya (CUST1002, Plus): *"My payment failed but money was deducted.
 12. **Tracking** — confirmation notification on the customer's channel; lifecycle → resolved; CSAT requested.
 13. **Reviewer** — reply claims only successful actions, refund within limit, no PII → approved.
 
-The *Agent trace* tab shows each of these steps with timings and the escalation rules that were evaluated.
+The *Live agent flow* on the website replays each of these steps as an MCP tool call, with timings and the JSON each agent received and returned.
 
 ---
 

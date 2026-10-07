@@ -2,7 +2,14 @@
 
 A self-managing, multi-agent customer support desk that **understands** the issue, **gathers customer context**,
 **investigates** like a support engineer, **takes real actions**, **resolves automatically**, **escalates intelligently
-with a complete ticket**, **tracks the resolution** and **learns from CSAT**. UI: Streamlit. Tools: MCP server.
+with a complete ticket**, **tracks the resolution** and **learns from CSAT**.
+
+- **MCP-native:** every agent is a real MCP tool. The orchestrator is an MCP client that calls them over JSON-RPC, and
+  the same tools are published to Claude Desktop.
+- **Real channels:** customers write from **Telegram** on their phone (text and photos) and get replies with product
+  images; the **Email agent** sends real emails over Gmail SMTP.
+- **Live website:** a single Streamlit page replays every turn as a live agent flow (phone · agent network · MCP call log),
+  with a calm view of the data store underneath.
 
 ```
 Customer issue → Understand intent → Gather context → Investigate → Take actions
@@ -24,7 +31,7 @@ pip install pytest && python -m pytest -q
 Windows: `python -m venv .venv`, `.venv\Scripts\activate.bat`, then the same commands (`python -m streamlit run app.py`).
 
 The database (`data/supportpilot.db`, SQLite) is created and seeded automatically on first run with a synthetic
-support world anchored to *now*. Use **Reset demo data** in the sidebar to re-seed. Python ≥ 3.10.
+support world anchored to *now*; delete the file to re-seed. Python ≥ 3.10.
 
 Optional LLM: set `GROQ_API_KEY` (and `GROQ_MODEL`) in `.env` or `.streamlit/secrets.toml` (see the `.example`
 files). The LLM only breaks ties on ambiguous intents (choosing from the closed intent list) and polishes reply
@@ -33,19 +40,57 @@ wording — the polished reply is rejected unless every id, amount and date surv
 ## Deploy on Streamlit Community Cloud
 1. Push this folder to a new GitHub repo.
 2. New app → main file `app.py` → Advanced settings → Python 3.11+.
-3. (Optional) add `GROQ_API_KEY` and `TELEGRAM_BOT_TOKEN` under *Secrets*.
+3. Add under *Secrets* (all optional):
+   ```toml
+   TELEGRAM_BOT_TOKEN = "123456:ABC..."     # from @BotFather
+   SMTP_USER = "you@gmail.com"              # Gmail that sends the emails
+   SMTP_PASSWORD = "abcd efgh ijkl mnop"    # Google App Password (needs 2-step verification)
+   GROQ_API_KEY = "gsk_..."                 # optional LLM polish
+   ```
+
+## The website
+One page, no sidebar:
+1. **Status strip:** Telegram bot, Email agent, MCP (number of agent tools, transport), LLM.
+2. **Live agent flow:** the newest turn from any channel replays automatically, within ~2 s of arriving.
+   - **Phone:** the customer's message (and photo), then the reply with product images, ⭐ buttons and an email toast.
+   - **Agent network:** the orchestrator (MCP client) sends each `tools/call` as a packet to one of 15 agents; the node
+     works, the result returns, and the agent says in plain English what it did.
+   - **MCP call log:** every call with its timing and the JSON arguments/result that crossed the wire.
+   - **Footer:** the outcome, plus exactly what was saved to the data store (ticket, conversation, actions, email…).
+3. **No Telegram? Try it here:** the only input on the site (customer, message, optional photo and email).
+4. **Inside the data store:**
+   - **Overview:** KPIs, root-cause alerts and the volume chart.
+   - **Tickets:** opening a ticket shows photos and product images, plus a human-agent update form whose updates reach
+     the customer on Telegram and by email.
+   - Customers & orders, the product catalog, the email log with rendered previews, and the live MCP tool catalog.
+
+## Email agent
+`agents/email_agent.py` sends real email with Gmail SMTP (`SMTP_USER` + a Google **App Password** in `SMTP_PASSWORD`).
+- **What it sends:** ticket confirmations (status badge, the reply, Ordered/Received product images inline, ticket facts)
+  and status updates when a human agent changes the ticket on the website.
+- **Who gets it:** only an address the customer gave in this conversation. The bot asks after a ticket is created, or the
+  customer sends `/email you@x.com`. Seeded demo addresses are never emailed.
+- **Limits and logging:** at most 5 emails per address per hour. Every attempt (sent / failed / not configured /
+  rate-limited / blocked) is logged and shown on the website.
+
+## Product images
+`assets/products/*.png` are flat illustrations of the 14 catalog items, drawn as SVG by
+`scripts/render_product_images.py` and rendered once to PNG. The **Media agent** (`agents/media.py`) picks the right
+ones per turn, e.g. *Ordered* vs *Received* for a wrong item. They are sent as a Telegram album, embedded in emails and
+shown on the website. Customer photos sent from Telegram (or uploaded on the website) are stored as evidence, add a
+"Photo evidence" step to troubleshooting, and are attached to the ticket.
 
 ## Real Telegram bot
-Customers can talk to SupportPilot from the Telegram app on their phone; the website shows the conversation and
-the agents' flow live in the **Telegram live** tab.
+Customers can talk to SupportPilot from the Telegram app on their phone; the website replays every turn live.
 1. In Telegram open **@BotFather** → `/newbot` → pick a name and a username ending in `bot` → copy the token.
 2. Set `TELEGRAM_BOT_TOKEN` in Streamlit *Secrets* (or `.env` locally) and restart the app.
 3. Open the bot on your phone → **Start** → pick a demo customer (or continue as guest) → describe the issue.
 
 How it works: `telegram_bot.py` long-polls the Bot API on a background thread inside the Streamlit server
 (no webhook or public URL needed), runs each message through the same orchestrator with `channel="telegram"`,
-replies in the chat (⭐ buttons for CSAT) and stores every turn for the website. Ticket updates a human agent makes
-in the **Tickets** tab are pushed back to the customer's chat. Commands: `/start`, `/login`, `/guest`, `/new`, `/help`.
+replies in the chat (product images, ⭐ buttons for CSAT), accepts **photos** as evidence, offers an **email copy** of
+each ticket and stores every turn for the website. Ticket updates a human agent makes on the website are pushed back to
+the customer's chat and email. Commands: `/start`, `/login`, `/guest`, `/email you@x.com`, `/new`, `/help`.
 Run it on its own with `python telegram_bot.py` (share the database via `SUPPORTPILOT_DB`).
 
 Notes: only one copy of the bot may poll a token at a time — stop the local app while the cloud app is running, or
@@ -77,7 +122,7 @@ until someone opens the website. Telegram messages are visible to anyone who can
 | SLA monitoring | Premium high priority: 15-min response; at-risk at 75% of the deadline; auto-escalation to the Escalation Desk |
 | Supervisor dashboard | open tickets, resolution / AI-resolved / escalation rates, avg resolution time (AI vs human), CSAT, SLA risk, volume by category, CSAT by issue, channel mix, learned thresholds, notifications |
 
-## Demo personas (sidebar → *Demo scenarios*)
+## Demo personas (Telegram `/login`, or *Try it here* on the website)
 | Customer | Scenario | Outcome |
 |---|---|---|
 | CUST1001 Aarav (Premium) | wrong item delivered | replacement + return pickup, auto-resolved |
@@ -94,10 +139,23 @@ until someone opens the website. Telegram messages are visible to anyone who can
 | CUST1012 Dev (Premium) | ₹54,999 laptop damaged | QC pickup + **Fulfilment approval** escalation |
 
 ## MCP integration
-`mcp_server.py` uses the official `mcp` Python SDK (v2 `MCPServer`, falls back to v1 `FastMCP`) and shares the app's
-database, so tickets created from Claude appear on the dashboard immediately.
+**Inside the app:** `agents/tools.py` registers every agent as a JSON-in/JSON-out tool. `agents/mcp_bus.py` builds an
+`MCPServer` from them and opens an in-process `mcp.Client` session on a background event loop. The orchestrator
+(`handle_message`) makes every agent step a real `tools/call`, and the trace records tool, transport, timing,
+arguments and result.
+- **State:** the conversation and the active issue are passed in and returned explicitly, because MCP arguments are copies.
+- **Fallback:** `SUPPORTPILOT_MCP=0` (or an MCP failure) falls back to direct calls, marked `transport: direct`.
+- **Tests:** they check that both paths give the same outcomes.
 
-**Tools (16):** `support_handle_message` (full workflow, multi-turn via `conversation_id`), `support_channel_message`,
+**For Claude:** `mcp_server.py` uses the official `mcp` Python SDK (v2 `MCPServer`, falls back to v1 `FastMCP`) and
+shares the app's database, so tickets created from Claude appear on the website immediately. It publishes **33 tools**:
+
+**Agent tools (17)**, the same ones the orchestrator calls: `normalize_channel`, `understand_message`,
+`track_conversation`, `customer_context`, `search_knowledge`, `troubleshoot`, `decide_escalation`, `execute_actions`,
+`create_ticket`, `track_resolution`, `ticket_status`, `select_media`, `send_email`, `compose_reply`, `polish_reply`,
+`review_reply`, `record_csat`.
+
+**Desk tools (16):** `support_handle_message` (full workflow, multi-turn via `conversation_id`), `support_channel_message`,
 `support_classify_intent`, `support_get_customer_context`, `support_search_knowledge`, `support_troubleshoot`,
 `support_execute_action`, `support_list_actions`, `support_get_ticket`, `support_list_tickets`,
 `support_update_ticket` (with KB expansion), `support_record_csat`, `support_sla_scan`,
@@ -120,7 +178,8 @@ Claude Desktop (`claude_desktop_config.json`):
 ## Architecture
 Inbound (any channel) → Orchestrator plan → Omnichannel adapter → Understanding → Memory → Customer context →
 Knowledge retrieval → Troubleshooting → Escalation (pre-action) → Action execution → Escalation (post-action) →
-Ticket → Resolution tracking → Response (sentiment-aware) → CSAT → Reviewer guardrail → Streamlit / MCP.
+Ticket → Resolution tracking → Media → Response (sentiment-aware) → Email → CSAT → Reviewer guardrail →
+Telegram / website / MCP. Every arrow is an MCP `tools/call` from the orchestrator (MCP client) to an agent tool.
 All numbers, ids and decisions come from deterministic tools over the data — the optional LLM never decides or invents facts.
 
 ## Data
@@ -136,11 +195,15 @@ add real, unseen customer messages for an honest benchmark.
 
 ## Project structure
 ```
-telegram_bot.py         real Telegram channel (long polling) feeding the Telegram live tab
-agent_flow.py           live agent-flow board (replays each turn stage by stage)
-app.py                  Streamlit UI (chat, Telegram live, agent trace, tickets workspace, supervisor dashboard, KB, omnichannel, architecture)
-mcp_server.py           MCP server (stdio / streamable HTTP)
-agents/                 one module per agent + shared_agent.py (taxonomy, SLA, LLM) + store.py (SQLite)
+app.py                  Streamlit website (status, live agent flow, try-it box, data store views)
+ui/flow_component.py    the live agent-flow component (phone · agent network · MCP call log)
+telegram_bot.py         real Telegram channel (long polling): text + photos in, replies + product images out, email capture
+mcp_server.py           MCP server for Claude (stdio / streamable HTTP): agent tools + desk tools
+agents/                 one module per agent + shared_agent.py (taxonomy, SLA, secrets) + store.py (SQLite)
+agents/tools.py         MCP tool registry (every agent as a tool)
+agents/mcp_bus.py       the orchestrator's in-process MCP client/server
+agents/email_agent.py   Gmail SMTP email agent;  agents/media.py: product images + customer photos
+assets/products/        product illustrations (SVG + PNG);  scripts/render_product_images.py draws them
 data/generate_data.py   synthetic support world
 docs/support_kb.json    knowledge base (FAQs, policies, docs, troubleshooting workflows)
 evaluation/             eval set + runner

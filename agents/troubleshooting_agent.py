@@ -496,8 +496,24 @@ WORKFLOWS = {
 }
 
 
-def investigate(store, intent, ctx, slots, articles=None, ref=None, kb_conf=None):
+PHOTO_INTENTS = {"wrong_item", "damaged_item", "return_request", "refund_request"}
+
+
+def investigate(store, intent, ctx, slots, articles=None, ref=None, kb_conf=None, attachments=None):
     """Run the diagnostic workflow for an intent. `slots` may be updated with inferred ids."""
+    res = _investigate(store, intent, ctx, slots, articles, ref, kb_conf)
+    if attachments:
+        relevant = intent in PHOTO_INTENTS
+        res["steps"].insert(0, dict(check="Photo evidence", status="pass" if relevant else "info",
+                                    detail=f"{len(attachments)} customer photo(s) received and attached to the case"
+                                    + ("" if relevant else " (not needed for this issue)")))
+        if relevant and not res.get("missing_slots"):  # evidence strengthens a damage / wrong-item claim
+            res["confidence"] = round(min(0.99, res.get("confidence", 0) + 0.05), 2)
+        res["attachments"] = list(attachments)
+    return res
+
+
+def _investigate(store, intent, ctx, slots, articles=None, ref=None, kb_conf=None):
     ref = ref or now()
     r = _Run(intent if intent in INTENTS else "general_inquiry", store, ctx, slots, ref)
     if intent in NEEDS_IDENTITY and not ctx:

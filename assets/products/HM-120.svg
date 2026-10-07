@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ecf7f1"/><stop offset="1" stop-color="#cdeadb"/></linearGradient>
+    <filter id="soft" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="10"/></filter>
+  </defs>
+  <rect width="600" height="600" fill="url(#bg)"/>
+  <ellipse cx="300" cy="505" rx="190" ry="20" fill="#000" opacity=".13" filter="url(#soft)"/>
+  <path d="M120 270 Q110 230 150 226 Q300 210 450 226 Q490 230 480 270 Q470 320 480 370 Q490 410 450 414 Q300 430 150 414 Q110 410 120 370 Q130 320 120 270 Z" fill="#e9edf4" stroke="#d3d9e3" stroke-width="4" transform="translate(10 -64)"/>
+  <path d="M120 270 Q110 230 150 226 Q300 210 450 226 Q490 230 480 270 Q470 320 480 370 Q490 410 450 414 Q300 430 150 414 Q110 410 120 370 Q130 320 120 270 Z" fill="#ffffff" stroke="#d3d9e3" stroke-width="4" transform="translate(-6 40)"/>
+  <g fill="none" stroke="#e1e6ee" stroke-width="4" stroke-linecap="round"><path d="M170 330 Q300 310 430 330"/><path d="M170 420 Q300 440 430 420"/></g>
+  <rect x="380" y="380" width="60" height="26" rx="6" fill="#2a78d6" opacity=".85"/>
+</svg>

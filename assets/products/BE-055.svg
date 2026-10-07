@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fcedf4"/><stop offset="1" stop-color="#f3d3e2"/></linearGradient>
+    <filter id="soft" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="10"/></filter>
+  </defs>
+  <rect width="600" height="600" fill="url(#bg)"/>
+  <ellipse cx="300" cy="505" rx="190" ry="20" fill="#000" opacity=".13" filter="url(#soft)"/>
+  <ellipse cx="300" cy="182" rx="34" ry="44" fill="#2b2d33"/><rect x="270" y="214" width="60" height="44" rx="8" fill="#1f2126"/>
+  <rect x="242" y="256" width="116" height="214" rx="26" fill="#c98034"/>
+  <rect x="252" y="266" width="16" height="190" rx="8" fill="#ffffff" opacity=".22"/>
+  <rect x="262" y="318" width="96" height="98" rx="8" fill="#fffaf2"/>
+  <text x="310" y="358" text-anchor="middle" font-family="Helvetica, Arial" font-weight="800" font-size="24" fill="#c2410c">VIT C</text>
+  <text x="310" y="388" text-anchor="middle" font-family="Helvetica, Arial" font-size="13" fill="#6b7280">30 ml</text>
+</svg>

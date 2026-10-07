@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#eef4fc"/><stop offset="1" stop-color="#d3e3f7"/></linearGradient>
+    <filter id="soft" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="10"/></filter>
+  </defs>
+  <rect width="600" height="600" fill="url(#bg)"/>
+  <ellipse cx="300" cy="505" rx="190" ry="20" fill="#000" opacity=".13" filter="url(#soft)"/>
+  <rect x="252" y="96" width="96" height="140" rx="22" fill="#343b48"/><rect x="252" y="366" width="96" height="140" rx="22" fill="#343b48"/>
+  <g fill="#262c37"><rect x="292" y="420" width="16" height="8" rx="4"/><rect x="292" y="444" width="16" height="8" rx="4"/><rect x="292" y="468" width="16" height="8" rx="4"/></g>
+  <rect x="204" y="196" width="192" height="210" rx="54" fill="#1c2028"/><rect x="222" y="214" width="156" height="174" rx="40" fill="#0c1726"/>
+  <rect x="394" y="270" width="16" height="44" rx="7" fill="#a7adb6"/>
+  <path d="M260 262 A52 52 0 1 1 260 340" fill="none" stroke="#1baf7a" stroke-width="8" stroke-linecap="round"/>
+  <path d="M275 275 A36 36 0 1 1 275 327" fill="none" stroke="#eda100" stroke-width="8" stroke-linecap="round"/>
+  <text x="300" y="312" text-anchor="middle" font-family="Helvetica, Arial" font-weight="700" font-size="30" fill="#ffffff">10:09</text>
+</svg>

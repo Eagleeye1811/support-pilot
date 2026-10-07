@@ -1,6 +1,7 @@
 """Model Context Protocol server for SupportPilot.
 
-Exposes the multi-agent support system as MCP tools, resources and a prompt,
+Exposes the multi-agent support system as MCP tools, resources and a prompt —
+including every individual agent (the same tools the orchestrator calls over MCP) —
 so Claude (Desktop / Code / any MCP client) can act as — or supervise — the
 autonomous support desk. It shares the same SQLite store as the Streamlit app
 (data/supportpilot.db by default, override with SUPPORTPILOT_DB), so a ticket
@@ -24,6 +25,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import agents as A  # noqa: E402
+from agents.mcp_bus import add_agent_tools  # noqa: E402
 
 try:  # mcp >= 2.0
     from mcp.server.mcpserver import MCPServer as _Server
@@ -40,7 +42,14 @@ INSTRUCTIONS = (
     "knowledge base, manage tickets, run the SLA monitor and discover root causes. Demo customers: CUST1001-CUST1012."
 )
 
+INSTRUCTIONS += (
+    " Lower-level agent tools (understand_message, customer_context, search_knowledge, troubleshoot, decide_escalation, "
+    "execute_actions, create_ticket, select_media, send_email, ...) are the exact tools the SupportPilot orchestrator "
+    "itself calls over MCP for every customer message; use them to inspect or run a single agent."
+)
+
 mcp = _Server("supportpilot", instructions=INSTRUCTIONS)
+add_agent_tools(mcp, A.get_store())  # the same agent tools the orchestrator calls (agents/tools.py)
 
 
 def store():

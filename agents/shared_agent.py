@@ -282,19 +282,27 @@ def _load_env_file():
         pass
 
 
-def get_groq_api_key():
+PLACEHOLDERS = {"", "your_key_here", "your_token_here", "you@gmail.com", "your_app_password"}
+
+
+def get_secret(name, default=None):
+    """A setting from the environment / .env, else Streamlit secrets; placeholders count as unset."""
     _load_env_file()
-    api_key = os.getenv("GROQ_API_KEY")
-    if api_key and api_key.strip() and api_key.strip() != "your_key_here":
-        return api_key.strip()
+    value = (os.getenv(name) or "").strip()
+    if value not in PLACEHOLDERS:
+        return value
     try:
         import streamlit as st
-        secret = st.secrets.get("GROQ_API_KEY")
-        if secret and str(secret).strip() != "your_key_here":
-            return str(secret).strip()
+        value = str(st.secrets.get(name, "") or "").strip()
+        if value not in PLACEHOLDERS:
+            return value
     except Exception:
         pass
-    return None
+    return default
+
+
+def get_groq_api_key():
+    return get_secret("GROQ_API_KEY")
 
 
 def llm_enabled():

@@ -2,42 +2,53 @@
 
 Long polling needs no public webhook URL, so it runs inside the Streamlit app (one
 background thread per server process) or standalone with `python telegram_bot.py`.
-Each Telegram chat maps to one SupportPilot conversation; every turn is stored so the
-Streamlit "Telegram live" tab can replay how the agents handled it. Ticket updates made
-by a human agent on the website are delivered back to the customer's Telegram chat.
+Each Telegram chat maps to one SupportPilot conversation.
+
+- Text and photos in (photos are stored as evidence and attached to the ticket).
+- Replies out, with product images chosen by the Media Agent and ⭐ buttons for CSAT.
+- After a ticket is created the bot offers an email copy; the address is used by the Email Agent.
+- Ticket updates made by a human agent on the website reach the chat (and the email, if given).
+Every turn is written to the shared ``turns`` log, which the website replays live.
 """
 from __future__ import annotations
 
-import os
+import json
+import re
 import threading
 import time
 
 import requests
 
 import agents as A
-from agents.shared_agent import _load_env_file, iso
+from agents.email_agent import EMAIL_RE, mask
+from agents.mcp_bus import get_bus
+from agents.media import product_image_bytes, save_attachment
+from agents.orchestrator_agent import Tracer
+from agents.shared_agent import get_secret, iso
+from agents.turns import record_turn
 
 API = "https://api.telegram.org/bot{token}/{method}"
+FILE_API = "https://api.telegram.org/file/bot{token}/{path}"
 POLL_TIMEOUT = 10  # seconds; also how often website ticket updates are pushed to Telegram
 _RUNNING = {}  # token → bot: one poller per process, or Telegram answers 409 Conflict
 DEMO_CUSTOMERS = ["CUST1001", "CUST1002", "CUST1003", "CUST1005", "CUST1006", "CUST1008", "CUST1009", "CUST1010", "CUST1012"]
-HELP = ("Tell me your problem in your own words — orders, payments, refunds, login, subscriptions or internet.\n\n"
+EMAIL_OFFER = "📧 Want a copy of this ticket by email? Just reply with your email address (or say *skip*)."
+HELP = ("Tell me your problem in your own words — orders, payments, refunds, login, subscriptions or internet. "
+        "You can also send a photo of the item.\n\n"
         "/login — act as a demo customer (so I can see orders and accounts)\n"
         "/guest — continue without an account\n"
+        "/email you@example.com — get ticket updates by email\n"
         "/new — start a fresh conversation\n"
         "/help — show this message")
 
 
 def get_token():
-    _load_env_file()
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token or token == "your_token_here":
-        try:
-            import streamlit as st
-            token = str(st.secrets.get("TELEGRAM_BOT_TOKEN", "")).strip()
-        except Exception:
-            token = ""
-    return token if token and token != "your_token_here" else None
+    return get_secret("TELEGRAM_BOT_TOKEN")
+
+
+def decision_of(r):
+    d = r.get("decision")
+    return d["decision"] if isinstance(d, dict) else d
 
 
 class TelegramBot:
@@ -47,14 +58,26 @@ class TelegramBot:
         self.started = iso()
         self.username = None
         self._stop = threading.Event()
+        self._groups = {}  # media_group_id → ticket id, so a photo album becomes one case
 
     # ---- Bot API ---------------------------------------------------------------------------
-    def call(self, method, http_timeout=15, **params):
-        r = self.http.post(API.format(token=self.token, method=method), json=params, timeout=http_timeout)
+    def call(self, method, http_timeout=15, files=None, **params):
+        url = API.format(token=self.token, method=method)
+        if files:  # multipart upload: nested values must be JSON strings
+            data = {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in params.items()}
+            r = self.http.post(url, data=data, files=files, timeout=http_timeout + 30)
+        else:
+            r = self.http.post(url, json=params, timeout=http_timeout)
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"{method}: {data.get('description', r.status_code)}")
         return data["result"]
+
+    def download(self, file_id):
+        path = self.call("getFile", file_id=file_id)["file_path"]
+        r = self.http.get(FILE_API.format(token=self.token, path=path), timeout=30)
+        r.raise_for_status()
+        return r.content
 
     def send(self, chat_id, text, buttons=None):
         params = dict(chat_id=chat_id, text=text[:4000])
@@ -65,6 +88,20 @@ class TelegramBot:
         except RuntimeError:
             return self.call("sendMessage", **params)
 
+    def send_products(self, chat_id, media):
+        """Send the Media Agent's product images (an album for ordered-vs-received)."""
+        photos = [(m, product_image_bytes(m["sku"])) for m in media]
+        photos = [(m, raw) for m, raw in photos if raw]
+        if not photos:
+            return None
+        if len(photos) == 1:
+            m, raw = photos[0]
+            return self.call("sendPhoto", files={"photo": (f"{m['sku']}.png", raw, "image/png")},
+                             chat_id=chat_id, caption=m["caption"])
+        files = {m["sku"]: (f"{m['sku']}.png", raw, "image/png") for m, raw in photos}
+        album = [dict(type="photo", media=f"attach://{m['sku']}", caption=m["caption"]) for m, _ in photos]
+        return self.call("sendMediaGroup", files=files, chat_id=chat_id, media=album)
+
     def status(self, **fields):
         doc = self.store.get("meta", "telegram") or {}
         doc.update(fields, id="telegram", updated=iso())
@@ -74,7 +111,8 @@ class TelegramBot:
     def chat(self, chat_id, sender=None):
         doc = self.store.get("telegram_chats", chat_id)
         if doc is None:
-            doc = dict(id=str(chat_id), chat_id=chat_id, conv_id=None, customer_id=None, created_at=iso())
+            doc = dict(id=str(chat_id), chat_id=chat_id, conv_id=None, customer_id=None, contact_email=None,
+                       awaiting_email=False, last_ticket=None, created_at=iso())
         if sender:
             doc.update(first_name=sender.get("first_name") or "Telegram user", username=sender.get("username"))
         return doc
@@ -93,7 +131,7 @@ class TelegramBot:
         return rows
 
     def set_customer(self, doc, cid):
-        doc.update(customer_id=None if cid == "guest" else cid, conv_id=None)
+        doc.update(customer_id=None if cid == "guest" else cid, conv_id=None, awaiting_email=False)
         self.save_chat(doc)
         if cid == "guest":
             return "You're chatting as a guest. Ask any question — or share an order ID, email or phone so I can find your account."
@@ -105,11 +143,13 @@ class TelegramBot:
         if "callback_query" in upd:
             return self.handle_callback(upd["callback_query"])
         msg = upd.get("message") or upd.get("edited_message")
-        if not msg or not msg.get("text"):
-            if msg:
-                self.send(msg["chat"]["id"], "I can read text messages only — please type your issue.")
-            return
+        if not msg:
+            return None
         doc = self.chat(msg["chat"]["id"], msg.get("from"))
+        if msg.get("photo"):
+            return self.handle_photo(doc, msg)
+        if not msg.get("text"):
+            return self.send(doc["chat_id"], "I can read text and photos — please type your issue or send a picture.")
         text = msg["text"].strip()
         cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
         if cmd == "/start":
@@ -121,12 +161,22 @@ class TelegramBot:
         if cmd == "/guest":
             return self.send(doc["chat_id"], self.set_customer(doc, "guest"))
         if cmd == "/new":
-            doc["conv_id"] = None
+            doc.update(conv_id=None, awaiting_email=False)
             self.save_chat(doc)
             return self.send(doc["chat_id"], "Started a new conversation. What can I help with?")
+        if cmd == "/email":
+            return self.capture_email(doc, text[len("/email"):].strip())
         if cmd:
             return self.send(doc["chat_id"], HELP)
-        self.run_turn(doc, text, msg)
+        if doc.get("awaiting_email"):
+            if re.fullmatch(r"(skip|no|nope|no thanks|not now)[.!]?", text, re.I):
+                doc["awaiting_email"] = False
+                self.save_chat(doc)
+                return self.send(doc["chat_id"], "No problem — I'll keep you updated here on Telegram.")
+            if EMAIL_RE.match(text):
+                return self.capture_email(doc, text)
+            doc["awaiting_email"] = False  # they moved on to something else
+        return self.run_turn(doc, text, msg)
 
     def handle_callback(self, cq):
         data, chat_id = cq.get("data", ""), cq["message"]["chat"]["id"]
@@ -135,35 +185,104 @@ class TelegramBot:
         if data.startswith("login:"):
             return self.send(chat_id, self.set_customer(doc, data.split(":", 1)[1]))
         if data.startswith("csat:"):
-            self.run_turn(doc, data.split(":", 1)[1], None)
+            return self.run_turn(doc, data.split(":", 1)[1], None)
+        return None
 
-    def run_turn(self, doc, text, msg):
+    def handle_photo(self, doc, msg):
+        best = min(msg["photo"], key=lambda p: abs(p.get("width", 0) - 800))  # ~800px is plenty for evidence
+        try:
+            att = save_attachment(self.store, self.download(best["file_id"]), "image/jpeg", "telegram", msg.get("caption", ""))
+        except Exception as exc:
+            return self.send(doc["chat_id"], f"Sorry, I couldn't receive that photo ({exc}). Please try again.")
+        group = msg.get("media_group_id")
+        if group and group in self._groups:  # the rest of an album: attach to the same case silently
+            t = self.store.get("tickets", self._groups[group]) if self._groups[group] else None
+            if t:
+                t["attachments"] = (t.get("attachments") or []) + [att["id"]]
+                self.store.put("tickets", t["id"], t)
+            return None
+        text = (msg.get("caption") or "").strip() or "Here is a photo of the item I received."
+        r = self.run_turn(doc, text, msg, attachments=[att["id"]])
+        if group:
+            self._groups[group] = (r.get("ticket") or {}).get("id")
+        return r
+
+    def run_turn(self, doc, text, msg, attachments=None):
         self.call("sendChatAction", chat_id=doc["chat_id"], action="typing")
         payload = dict(message=dict(text=text, chat={"id": doc["chat_id"]},
                                     **{"from": (msg or {}).get("from") or {"username": doc.get("username")}}))
         before = iso()
         r = A.handle_message(self.store, conversation_id=doc["conv_id"], customer_id=doc["customer_id"], channel="telegram",
-                             payload=payload, use_llm=self.use_llm)
+                             payload=payload, use_llm=self.use_llm, attachments=attachments,
+                             contact_email=doc.get("contact_email"))
         conv = r.pop("conversation", {}) or {}
         doc["conv_id"] = r["conversation_id"]
         if conv.get("customer_id") and not doc.get("customer_id"):
             doc["customer_id"] = conv["customer_id"]  # identified from an order id / phone / email in the message
+        reply = r.get("reply_channel") or r["reply"]
+        if r.get("ticket"):
+            doc["last_ticket"] = r["ticket"]["id"]
+            if decision_of(r) in ("auto_resolve", "escalate") and not doc.get("contact_email"):
+                reply += "\n\n" + EMAIL_OFFER
+                doc["awaiting_email"] = True
         self.save_chat(doc)
         # notifications raised during this turn are already covered by the reply
         for n in self.store.list("notifications", where=lambda n: n.get("created_at", "") >= before):
             self.store.put("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), suppressed=True))
-        seq = self.store.next_seq("telegram_turn", 1)
-        self.store.put("telegram_turns", f"{seq:06d}", dict(id=f"{seq:06d}", seq=seq, chat_id=doc["chat_id"], conv_id=doc["conv_id"],
-                                                             text=text, ts=iso(), result=r))
+        record_turn(self.store, "telegram", text, r, chat_id=doc["chat_id"])
         buttons = [[{"text": "⭐" * i, "callback_data": f"csat:{i}"} for i in range(1, 6)]] \
             if r.get("awaiting") == "csat" else None
-        self.send(doc["chat_id"], r.get("reply_channel") or r["reply"], buttons)
+        self.send(doc["chat_id"], reply, buttons)
+        if r.get("media"):
+            try:
+                self.send_products(doc["chat_id"], r["media"])
+            except Exception as exc:  # images are a bonus; never lose the reply over them
+                self.status(error=f"sending product images: {exc}")
+        return r
+
+    def capture_email(self, doc, address):
+        address = address.strip().lower()
+        if not EMAIL_RE.match(address):
+            return self.send(doc["chat_id"], "That doesn't look like an email address — try again, e.g. /email you@gmail.com")
+        doc.update(contact_email=address, awaiting_email=False)
+        self.save_chat(doc)
+        conv = self.store.get("conversations", doc["conv_id"]) if doc.get("conv_id") else None
+        if conv:
+            conv["contact_email"] = address
+            self.store.put("conversations", conv["id"], conv)
+        ticket = self.store.get("tickets", doc["last_ticket"]) if doc.get("last_ticket") else None
+        if not ticket:
+            return self.send(doc["chat_id"], f"Saved {mask(address)} — I'll email you whenever a ticket is created or updated.")
+        rec = self.email_turn(doc, f"My email is {mask(address)}", ticket, kind="ticket")
+        note = {"sent": f"📧 Sent the ticket details to {mask(address)}. You'll get updates there too.",
+                "not_configured": "Saved your email, but email sending isn't set up on this demo yet.",
+                "rate_limited": "Saved your email — I've sent several emails already, so I'll hold off for a bit.",
+                "blocked": f"Saved your email, but I couldn't send to it ({rec.get('error', '')})."}
+        return self.send(doc["chat_id"], note.get(rec["status"],
+                                                  f"Saved your email, but sending failed ({rec.get('error', 'unknown error')})."))
+
+    def email_turn(self, doc, text, ticket, kind="ticket", message=""):
+        """Run just the Email Agent (over MCP) and log it as a turn so the website shows it."""
+        T = Tracer(get_bus(self.store))
+        T.note("Master Orchestrator (Planner)", "Email request → Email Agent")
+        conv = self.store.get("conversations", ticket.get("conversation_id") or "") or {}
+        last_reply = next((m["text"] for m in reversed(conv.get("messages", [])) if m["role"] == "assistant"), "")
+        media = [s for m in conv.get("messages", []) for s in (m.get("meta") or {}).get("media", [])][-2:]
+        ctx = A.customer_context(self.store, ticket.get("customer_id")) if ticket.get("customer_id") else None
+        rec = T.tool("Email Agent", "send_email",
+                     dict(to=doc["contact_email"], kind=kind, ticket_id=ticket["id"], reply=last_reply, message=message,
+                          media=media, customer_name=(ctx or {}).get("first_name")),
+                     lambda r: f"{r['status']} → {r['to_masked']}")
+        record_turn(self.store, "telegram", text, dict(conversation_id=ticket.get("conversation_id"), channel="telegram",
+                                                       ticket=ticket, email=rec, trace=T.steps, context=ctx, media=[],
+                                                       decision="email",
+                                                       reply=f"Email {rec['status'].replace('_', ' ')} → {rec['to_masked']}"),
+                    chat_id=doc["chat_id"])
+        return rec
 
     def deliver_notifications(self):
-        """Send ticket updates made on the website (status changes, SLA escalations) to the customer's chat."""
+        """Send ticket updates made on the website (status changes, SLA escalations) to the customer's chat and email."""
         chats = {c["conv_id"]: c for c in self.store.list("telegram_chats") if c.get("conv_id")}
-        if not chats:
-            return
         for n in self.store.list("notifications", where=lambda n: n.get("created_at", "") >= self.started and n.get("ticket_id")):
             if self.store.get("telegram_sent", n["id"]):
                 continue
@@ -171,6 +290,9 @@ class TelegramBot:
             chat = chats.get(t.get("conversation_id"))
             if chat:
                 self.send(chat["chat_id"], f"🔔 Update on {n['ticket_id']}: {n['message']}")
+                if chat.get("contact_email"):
+                    self.email_turn(chat, f"Ticket {n['ticket_id']} updated on the website", t, kind="update",
+                                    message=n["message"])
             self.store.put("telegram_sent", n["id"], dict(id=n["id"], ts=iso(), delivered=bool(chat)))
 
     # ---- loop ----------------------------------------------------------------------------------
