@@ -208,8 +208,7 @@ with tabs[0]:
         if not last:
             st.info("Send a message and watch every agent pick it up, stage by stage, right here.", icon=":material/psychology:")
         else:
-            st.markdown('<div class="sp-card-title">Live agent flow</div>', unsafe_allow_html=True)
-            render_flow(ss.turns[-1]["text"], last, theme=THEME, height=700)
+            render_flow(ss.turns[-1]["text"], last, theme=THEME, height=860, store=store)
             with st.expander("Detailed agent outputs", icon=":material/data_object:"):
                 u = last.get("understanding")
                 d = last.get("decision")
@@ -337,8 +336,7 @@ def telegram_live():
             return
         # no widget key: when a new message arrives the options change and the newest turn is selected again
         turn = st.selectbox("Message", turns[::-1], format_func=lambda t: f"{fmt_ts(t['ts'])} · {t['text'][:60]}")
-        st.markdown('<div class="sp-card-title">Live agent flow</div>', unsafe_allow_html=True)
-        render_flow(turn["text"], turn["result"], theme=THEME, height=700)
+        render_flow(turn["text"], turn["result"], theme=THEME, height=860, store=store, ts=turn["ts"])
 
 
 with tabs[1]:
@@ -374,7 +372,7 @@ with tabs[2]:
         idx = st.selectbox("Turn", range(len(ss.turns)), index=len(ss.turns) - 1,
                            format_func=lambda i: f"{i + 1}. {ss.turns[i]['text'][:80]}")
         r = ss.turns[idx]["result"]
-        render_flow(ss.turns[idx]["text"], r, theme=THEME, height=760)
+        render_flow(ss.turns[idx]["text"], r, theme=THEME, height=860, store=store)
         c1, c2 = st.columns(2)
         with c1:
             st.markdown('<div class="sp-card-title">Reviewer guardrail</div>', unsafe_allow_html=True)

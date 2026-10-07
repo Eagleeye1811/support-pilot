@@ -88,7 +88,7 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"], attachments=attachments))
     out = dict(conversation_id=conv["id"], channel=inbound["channel"], inbound=inbound, understanding=None, issue=None,
                mode=None, context=None, articles=[], workflow=None, investigation=None, actions=[], decision=None,
-               pre_decision=None, ticket=None, review=None, llm_polished=False, email=None)
+               pre_decision=None, ticket=None, review=None, llm_polished=False, email=None, attachments=attachments)
 
     def finish(reply, ctx=None, decision=None, ticket=None, intent=None, actions=()):
         polished = False

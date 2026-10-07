@@ -1,7 +1,8 @@
-"""Live agent-flow board: replays one orchestrated turn agent by agent, in plain English.
+"""Live agent flow: replays one orchestrated turn — message in, agents at work, reply out.
 
-The agents run in a few milliseconds, so the board replays the real trace at a readable
-pace: every agent is visible at once, grouped by stage, and lights up as it works.
+The agents run in a few milliseconds, so the view replays the real trace at a readable pace:
+the incoming message, a stage stepper, each agent working then reporting in plain English,
+and finally the reply with its outcome. It follows the page's light / dark theme.
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import json
 
 import streamlit as st
 
-from agents.shared_agent import CHANNELS, INTENTS, inr
+from agents.shared_agent import CHANNELS, INTENTS, fmt_ts, inr
 
 # stage key, title, one-line purpose
 STAGES = [
@@ -136,8 +137,8 @@ def _explain(step, r, seen):
     return step.get("summary") or ""
 
 
-def build_flow(turn_text, r):
-    """Board data for one turn: the steps that ran (in order) plus the agents that were not needed."""
+def build_flow(turn_text, r, store=None, ts=None):
+    """Board data for one turn: the message, the steps that ran (in order), the agents not needed, and the reply."""
     seen, steps = {}, []
     for s in r.get("trace") or []:
         k = _key(s["agent"])
@@ -149,18 +150,30 @@ def build_flow(turn_text, r):
         steps.append(dict(stage=stage, agent=k, name=name, icon=icon, ok=s["status"] == "OK",
                           text=_explain(s, r, seen), tech=s.get("summary") or "", ms=s.get("ms", 0)))
     ran = {s["agent"] for s in steps}
-    skipped = [dict(stage=st, agent=k, name=n, icon=i) for k, (st, n, i) in AGENTS.items() if k not in ran]
+    skipped = [dict(stage=st_, agent=k, name=n, icon=i) for k, (st_, n, i) in AGENTS.items() if k not in ran]
     d = r.get("decision")
     decision = d["decision"] if isinstance(d, dict) else d
     outcome, tone = DECISION_TEXT.get(decision, ("Replied to the customer", "info"))
-    return dict(message=turn_text, steps=steps, skipped=skipped, stages=[dict(key=k, title=t, sub=s) for k, t, s in STAGES],
-                total_ms=round(sum(s["ms"] for s in steps), 1), outcome=outcome, tone=tone,
-                reply=(r.get("reply") or "")[:240], ticket=(r.get("ticket") or {}).get("id"))
+    ctx = r.get("context") or {}
+    photos = []
+    for att_id in (r.get("attachments") or [])[:2]:
+        att = store.get("attachments", att_id) if store else None
+        if att:
+            photos.append(f"data:{att['mime']};base64,{att['data']}")
+    email = r.get("email") or None
+    return dict(
+        message=turn_text, customer=ctx.get("name") or "Guest", tier=ctx.get("tier"),
+        channel=CHANNELS.get(r.get("channel"), r.get("channel") or "Website Chat"), ts=fmt_ts(ts) if ts else "",
+        photos=photos, steps=steps, skipped=skipped,
+        stages=[dict(key=k, title=t, sub=s) for k, t, s in STAGES],
+        total_ms=round(sum(s["ms"] for s in steps), 1), outcome=outcome, tone=tone,
+        reply=(r.get("reply") or "").replace("**", ""), ticket=(r.get("ticket") or {}).get("id"),
+        email=dict(status=email.get("status"), to=email.get("to_masked")) if email else None)
 
 
-def render_flow(turn_text, r, theme="light", height=720, autoplay=True):
-    # \u003c keeps customer text from ever closing the <script> block
-    data = json.dumps(build_flow(turn_text, r), ensure_ascii=False).replace("<", "\\u003c")
+def render_flow(turn_text, r, theme="light", height=720, autoplay=True, store=None, ts=None):
+    # < keeps customer text from ever closing the <script> block
+    data = json.dumps(build_flow(turn_text, r, store, ts), ensure_ascii=False).replace("<", "\\u003c")
     html = TEMPLATE.replace("__DATA__", data).replace("__THEME__", "dark" if theme == "dark" else "light") \
         .replace("__AUTOPLAY__", "true" if autoplay else "false")
     if hasattr(st, "iframe"):
@@ -171,136 +184,209 @@ def render_flow(turn_text, r, theme="light", height=720, autoplay=True):
 
 
 TEMPLATE = r"""<!doctype html>
-<html data-theme="__THEME__"><head><meta charset="utf-8">
+<html data-theme="__THEME__"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#ffffff;--panel:#f6f7f9;--line:#d9dde3;--text:#1d2129;--muted:#6b7280;--accent:#2a78d6;--accent-soft:#e3eefb;
- --good:#1a8f5f;--good-soft:#e2f5ec;--warn:#c25e00;--warn-soft:#fdeedd;--info:#2a78d6;--info-soft:#e3eefb;--bad:#c62828}
-[data-theme="dark"]{--bg:#0e1117;--panel:#171b23;--line:#2c323d;--text:#e6e8eb;--muted:#9aa3ae;--accent:#5b9cf0;--accent-soft:#1a2a40;
- --good:#4cc38a;--good-soft:#14301f;--warn:#f0a050;--warn-soft:#3a2614;--info:#5b9cf0;--info-soft:#1a2a40;--bad:#ef6b6b}
+:root{--bg:#ffffff;--panel:#f6f8fb;--card:#ffffff;--line:#e3e8ef;--text:#111827;--muted:#6b7280;--accent:#2563eb;
+ --accent-soft:#e8f0fe;--good:#15803d;--good-soft:#e7f6ec;--warn:#b45309;--warn-soft:#fdf1e2;--bad:#b91c1c;
+ --in:#eef2f7;--out:#e3f0ff;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08)}
+[data-theme="dark"]{--bg:#0e1117;--panel:#141922;--card:#1a202b;--line:#2a3240;--text:#e8ebf0;--muted:#9aa4b2;--accent:#60a5fa;
+ --accent-soft:#17263d;--good:#4ade80;--good-soft:#132a1d;--warn:#fbbf24;--warn-soft:#33260f;--bad:#f87171;
+ --in:#202734;--out:#173150;--shadow:none}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Source Sans Pro",-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{height:100vh;display:flex;flex-direction:column;gap:10px;padding:2px 4px}
-.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.msg{flex:1;min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;
- white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.msg b{color:var(--muted);font-weight:600;margin-right:6px}
-button{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:8px;
- padding:6px 10px;cursor:pointer}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+ font:14px/1.45 "Source Sans Pro","Inter",-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{height:100vh;display:flex;flex-direction:column;gap:10px;padding:2px 2px 6px}
+/* header */
+.top{display:flex;align-items:center;gap:8px}
+.top .pill{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:560px){.top h3{display:none}.lbl{display:none}}
+.top h3{margin:0;font-size:15px;font-weight:700}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;border-radius:999px;padding:3px 10px;
+ background:var(--panel);color:var(--muted);border:1px solid var(--line)}
+.pill i{width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.live{color:var(--accent);background:var(--accent-soft);border-color:transparent}
+.pill.live i{animation:pulse 1s infinite}
+.pill.done{color:var(--good);background:var(--good-soft);border-color:transparent}
+.sp{flex:1}
+button{font:inherit;font-size:12px;white-space:nowrap;flex:none;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;
+ padding:4px 10px;cursor:pointer}
 button:hover{border-color:var(--accent);color:var(--accent)}
-.bar{height:4px;background:var(--line);border-radius:4px;overflow:hidden}
-.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .35s ease}
-.board{flex:1;overflow-y:auto;padding-right:4px;scroll-behavior:smooth}
-.stage{border:1px solid var(--line);border-radius:12px;padding:8px 10px;margin-bottom:6px;transition:border-color .3s,background .3s}
-.stage.live{border-color:var(--accent);background:var(--accent-soft)}
-.stage h4{margin:0;font-size:13px;letter-spacing:.02em;display:flex;align-items:baseline;gap:8px}
-.stage h4 span{font-weight:400;color:var(--muted);font-size:12px}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px}
-.chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
- color:var(--muted);background:var(--bg);transition:all .3s}
-.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--line)}
-.chip.work{color:var(--accent);border-color:var(--accent)}
-.chip.work .dot{background:var(--accent);animation:pulse .8s infinite}
-.chip.done{color:var(--text);border-color:var(--good)}
-.chip.done .dot{background:var(--good)}
-.chip.err .dot{background:var(--bad)}
-.chip.skip{opacity:.45;border-style:dashed}
-.rows{margin-top:4px}
-.row{display:flex;gap:8px;padding:6px 2px 4px;border-top:1px dashed var(--line);animation:in .35s ease}
-.row .ic{font-size:16px;line-height:20px}
-.row .nm{font-weight:600;font-size:13px}
-.row .tx{font-size:13px}
-.row .tc{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);margin-top:2px;display:none;word-break:break-word}
+/* message cards */
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px;box-shadow:var(--shadow)}
+.who{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.ava{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;color:#fff;font-weight:700;flex:none}
+.ava.cust{background:#64748b}.ava.bot{background:linear-gradient(135deg,#2563eb,#7c3aed)}
+.who b{color:var(--text);font-size:13px}
+.new{margin-left:auto;white-space:nowrap;font-size:10.5px;font-weight:700;letter-spacing:.04em;color:#fff;background:var(--accent);border-radius:6px;
+ padding:2px 7px;animation:blink 1.2s ease 3}
+.bubble{border-radius:12px;padding:8px 11px;white-space:pre-wrap;word-wrap:break-word;font-size:13.5px}
+.bubble.in{background:var(--in)}
+.bubble.out{background:var(--out);max-height:120px;overflow:auto}
+.photos{display:flex;gap:6px;margin-bottom:6px}.photos img{height:64px;border-radius:10px;border:1px solid var(--line)}
+#msg{animation:slide .45s ease}
+/* stepper */
+.stepper{display:flex;align-items:flex-start;padding:2px 4px}
+.stg{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;position:relative;font-size:11.5px;color:var(--muted);text-align:center}
+.stg .dot{width:26px;height:26px;border-radius:50%;border:2px solid var(--line);background:var(--card);display:grid;place-items:center;
+ font-size:12px;font-weight:700;z-index:1;transition:all .3s}
+.stg::before{content:"";position:absolute;top:12px;left:-50%;width:100%;height:2px;background:var(--line);z-index:0}
+.stg:first-child::before{display:none}
+.stg.done .dot{background:var(--good);border-color:var(--good);color:#fff}
+.stg.done::before,.stg.now::before{background:var(--good)}
+.stg.now .dot{border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+.stg.now{color:var(--accent);font-weight:700}.stg.done{color:var(--text)}
+.stg.idle{opacity:.55}
+/* timeline */
+.feed{flex:1;min-height:0;overflow-y:auto;padding:2px 4px 2px 2px;scroll-behavior:smooth}
+.row{display:flex;gap:10px;padding:5px 8px;border-radius:12px;animation:slide .3s ease;transition:background .3s}
+.row .ic{width:28px;height:28px;border-radius:10px;background:var(--panel);border:1px solid var(--line);display:grid;place-items:center;
+ font-size:16px;flex:none}
+.row .bd{flex:1;min-width:0}
+.row .nm{display:flex;align-items:center;gap:6px;font-weight:700;font-size:13px}
+.row .st{font-size:11px;font-weight:600;border-radius:6px;padding:1px 6px}
+.row .tx{font-size:13px;color:var(--text);margin-top:1px}
+.row .tc{display:none;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);margin-top:3px;word-break:break-word}
 .tech .row .tc{display:block}
-.typing{color:var(--accent);font-size:13px}
-.typing::after{content:"";animation:dots 1s steps(4) infinite}
-.end{border-radius:12px;padding:10px 12px;display:none;animation:in .4s ease}
-.end.good{background:var(--good-soft);border:1px solid var(--good)}
-.end.warn{background:var(--warn-soft);border:1px solid var(--warn)}
-.end.info{background:var(--info-soft);border:1px solid var(--info)}
-.end .t{font-weight:700}
-.end .r{font-size:13px;color:var(--text);margin-top:4px;opacity:.9}
-.foot{font-size:12px;color:var(--muted)}
-label{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:4px;cursor:pointer}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(1.5)}}
-@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-@keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+.row.work{background:var(--accent-soft)}
+.row.work .ic{border-color:var(--accent)}
+.row.work .st{color:var(--accent);background:var(--card)}
+.row.work .tx{color:var(--muted)}
+.row.ok .st{color:var(--good);background:var(--good-soft)}
+.row.err .st{color:var(--bad)}
+.spin{width:11px;height:11px;border:2px solid var(--accent);border-right-color:transparent;border-radius:50%;display:inline-block;
+ animation:spin .7s linear infinite;vertical-align:-1px}
+.skipped{font-size:12px;color:var(--muted);padding:4px 8px}
+/* outcome */
+#out{display:none;animation:slide .45s ease}
+.oc{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:12px;font-weight:600;border-radius:999px;padding:3px 10px}
+.chip.good{color:var(--good);background:var(--good-soft)}.chip.warn{color:var(--warn);background:var(--warn-soft)}
+.chip.info{color:var(--accent);background:var(--accent-soft)}
+.foot{font-size:11.5px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+label{display:inline-flex;gap:4px;align-items:center;cursor:pointer}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slide{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div class="wrap">
   <div class="top">
-    <div class="msg" id="msg"></div>
-    <button id="replay" title="Watch the agents again">↻ Replay</button>
-    <button id="skip" title="Show everything now">⏭ Skip</button>
+    <h3>Live agent flow</h3><span class="pill" id="status"><i></i><span id="stxt">Waiting</span></span><span class="sp"></span>
+    <button id="replay" title="Watch it again">↻<span class="lbl"> Replay</span></button><button id="skip" title="Show everything now">⏭<span class="lbl"> Skip</span></button>
   </div>
-  <div class="bar"><i id="prog"></i></div>
-  <div class="board" id="board"></div>
-  <div class="end" id="end"><div class="t" id="endT"></div><div class="r" id="endR"></div></div>
-  <div class="foot" id="foot"></div>
+
+  <div class="card" id="msg">
+    <div class="who"><div class="ava cust" id="ini"></div><div><b id="cust"></b> <span id="meta"></span></div><span class="new" id="newb">NEW MESSAGE</span></div>
+    <div class="photos" id="photos"></div>
+    <div class="bubble in" id="mtext"></div>
+  </div>
+
+  <div class="stepper" id="stepper"></div>
+  <div class="feed" id="feed"></div>
+
+  <div class="card" id="out">
+    <div class="who"><div class="ava bot">🛟</div><div><b>SupportPilot</b> replied to the customer</div></div>
+    <div class="bubble out" id="rtext"></div>
+    <div class="oc" id="chips"></div>
+  </div>
+  <div class="foot"><span id="ftxt"></span><label><input type="checkbox" id="techT"> technical details</label></div>
 </div>
 <script>
-const D = __DATA__;
-const AUTOPLAY = __AUTOPLAY__;
-const STEP_MS = 900, WORK_MS = 520;
+const D = __DATA__, AUTOPLAY = __AUTOPLAY__;
 const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const STEP = 1000, WORK = 520;
 let timers = [];
 
-$("msg").innerHTML = "<b>Customer:</b>" + esc(D.message);
-$("foot").innerHTML = `Real run time <b>${D.total_ms} ms</b> for ${D.steps.length} agent steps — replayed slowly so you can follow it.
-  <label style="margin-left:8px"><input type="checkbox" id="techT"> show technical output</label>`;
+// Follow the host page's real theme (st.iframe is same-origin); the server-side hint is only a fallback.
+function syncTheme() {
+  try {
+    const host = parent.document.querySelector(".stApp") || parent.document.body;
+    const m = getComputedStyle(host).backgroundColor.match(/\d+(\.\d+)?/g);
+    if (m) {
+      const [r, g, b] = m.map(Number);
+      document.documentElement.dataset.theme = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5 ? "dark" : "light";
+    }
+  } catch (e) {}
+}
+syncTheme(); setInterval(syncTheme, 1500);
+
+$("cust").textContent = D.customer + (D.tier ? " · " + D.tier : "");
+$("meta").textContent = "via " + D.channel + (D.ts ? " · " + D.ts : "");
+$("ini").textContent = (D.customer || "?").trim()[0].toUpperCase();
+$("mtext").textContent = D.message;
+$("photos").innerHTML = D.photos.map(p => `<img src="${p}" alt="photo from the customer">`).join("");
+$("photos").style.display = D.photos.length ? "flex" : "none";
+$("rtext").textContent = D.reply || "—";
 $("techT").onchange = e => document.body.classList.toggle("tech", e.target.checked);
+const stageIndex = k => D.stages.findIndex(s => s.key === k);
+const used = new Set(D.steps.map(s => s.stage));
 
-function build() {
-  const board = $("board");
-  board.innerHTML = "";
-  D.stages.forEach(st => {
-    const box = document.createElement("div");
-    box.className = "stage"; box.id = "st-" + st.key;
-    const chips = [];
-    const added = new Set();
-    D.steps.forEach((s, i) => { if (s.stage === st.key && !added.has(s.agent)) { added.add(s.agent);
-      chips.push(`<span class="chip" id="ch-${s.agent}"><span class="dot"></span>${s.icon} ${esc(AGENT_NAME(s))}</span>`); } });
-    D.skipped.filter(s => s.stage === st.key).forEach(s =>
-      chips.push(`<span class="chip skip" title="Not needed for this message"><span class="dot"></span>${s.icon} ${esc(s.name)}</span>`));
-    box.innerHTML = `<h4>${esc(st.title)} <span>${esc(st.sub)}</span></h4><div class="chips">${chips.join("")}</div><div class="rows" id="rows-${st.key}"></div>`;
-    board.appendChild(box);
-  });
+function setStatus(cls, text) { $("status").className = "pill " + cls; $("stxt").textContent = text; }
+function drawStepper(current, doneUpTo) {
+  $("stepper").innerHTML = D.stages.map((s, i) => {
+    const cls = i < doneUpTo ? "done" : i === current ? "now" : (used.has(s.key) ? "" : "idle");
+    return `<div class="stg ${cls}" title="${esc(s.sub)}"><div class="dot">${i < doneUpTo ? "✓" : i + 1}</div>${esc(s.title.replace(" & act", ""))}</div>`;
+  }).join("");
 }
-function AGENT_NAME(s){ return s.agent === "7" ? "Escalation" : s.name; }
-
-function showStep(i, instant) {
-  const s = D.steps[i];
-  document.querySelectorAll(".stage").forEach(b => b.classList.remove("live"));
-  const stage = $("st-" + s.stage); stage.classList.add("live");
-  const chip = $("ch-" + s.agent); chip.classList.remove("done"); chip.classList.add("work");
-  const rows = $("rows-" + s.stage);
-  const row = document.createElement("div"); row.className = "row";
-  row.innerHTML = `<div class="ic">${s.icon}</div><div><div class="nm">${esc(s.name)}</div>
-    <div class="tx typing">working</div><div class="tc">${esc(s.tech)} · ${s.ms} ms</div></div>`;
-  rows.appendChild(row);
-  const finish = () => {
-    const tx = row.querySelector(".tx"); tx.className = "tx"; tx.textContent = s.text;
-    chip.classList.remove("work"); chip.classList.add(s.ok ? "done" : "err");
-    $("prog").style.width = ((i + 1) / D.steps.length * 100) + "%";
-  };
-  if (instant) finish(); else { timers.push(setTimeout(finish, WORK_MS)); }
-  if (!instant) stage.scrollIntoView({block: "nearest", behavior: "smooth"});
+function addRow(s, i, instant) {
+  const row = document.createElement("div");
+  row.className = "row " + (instant ? "" : "work"); row.id = "r" + i;
+  row.innerHTML = `<div class="ic">${s.icon}</div><div class="bd"><div class="nm">${esc(s.name)}
+    <span class="st"><span class="spin"></span> working</span></div>
+    <div class="tx">Working on it…</div><div class="tc">${esc(s.tech)} · ${s.ms} ms</div></div>`;
+  $("feed").appendChild(row); $("feed").scrollTop = $("feed").scrollHeight;
+  return row;
 }
-function showEnd() {
-  document.querySelectorAll(".stage").forEach(b => b.classList.remove("live"));
-  const e = $("end"); e.className = "end " + D.tone; e.style.display = "block";
-  $("endT").textContent = "Outcome: " + D.outcome + (D.ticket ? " · " + D.ticket : "");
-  $("endR").textContent = D.reply ? "Reply: " + D.reply + (D.reply.length >= 240 ? "…" : "") : "";
-  $("prog").style.width = "100%";
+function finishRow(row, s) {
+  row.className = "row " + (s.ok ? "ok" : "err");
+  row.querySelector(".st").textContent = s.ok ? "✓ done" : "✗ error";
+  row.querySelector(".tx").textContent = s.text;
 }
-function reset() { timers.forEach(clearTimeout); timers = []; build(); $("end").style.display = "none"; $("prog").style.width = "0"; }
+function showOutcome() {
+  drawStepper(-1, D.stages.length);
+  $("out").style.display = "block";
+  const chips = [`<span class="chip ${D.tone}">${D.tone === "good" ? "✅" : D.tone === "warn" ? "🧑‍💼" : "💬"} ${esc(D.outcome)}</span>`];
+  if (D.ticket) chips.push(`<span class="chip info">🎫 ${esc(D.ticket)}</span>`);
+  if (D.email) chips.push(`<span class="chip ${D.email.status === "sent" ? "good" : "warn"}">📧 ${D.email.status === "sent" ? "Email sent to " + esc(D.email.to) : "Email " + esc(D.email.status.replace("_", " "))}</span>`);
+  $("chips").innerHTML = chips.join("");
+  if (D.skipped.length) {
+    const sk = document.createElement("div"); sk.className = "skipped";
+    sk.textContent = "Not needed for this message: " + D.skipped.map(s => s.name).join(", ");
+    $("feed").appendChild(sk);
+  }
+  setStatus("done", `Done · ${D.steps.length} agent steps in ${D.total_ms} ms`);
+}
+function reset() {
+  timers.forEach(clearTimeout); timers = [];
+  $("feed").innerHTML = ""; $("out").style.display = "none";
+  drawStepper(-1, 0);
+}
 function play() {
   reset();
-  D.steps.forEach((_, i) => timers.push(setTimeout(() => showStep(i, false), i * STEP_MS)));
-  timers.push(setTimeout(showEnd, D.steps.length * STEP_MS + 200));
+  $("newb").style.display = "inline-block";
+  setStatus("live", "New message received");
+  D.steps.forEach((s, i) => {
+    const t = 700 + i * STEP;
+    timers.push(setTimeout(() => {
+      const si = stageIndex(s.stage);
+      drawStepper(si, si);
+      setStatus("live", `Processing · step ${i + 1} of ${D.steps.length}`);
+      const row = addRow(s, i);
+      timers.push(setTimeout(() => finishRow(row, s), WORK));
+    }, t));
+  });
+  timers.push(setTimeout(() => { $("newb").style.display = "none"; showOutcome(); },
+                         700 + D.steps.length * STEP + 200));
 }
-function skip() { reset(); D.steps.forEach((_, i) => showStep(i, true)); showEnd(); }
+function skip() {
+  reset(); $("newb").style.display = "none";
+  D.steps.forEach((s, i) => finishRow(addRow(s, i, true), s));
+  $("feed").scrollTop = 0;
+  showOutcome();
+}
+$("ftxt").textContent = `The agents finished in ${D.total_ms} ms — replayed step by step so you can follow it.`;
 $("replay").onclick = play; $("skip").onclick = skip;
-const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-(AUTOPLAY && !reduce) ? play() : skip();
+(AUTOPLAY && !matchMedia("(prefers-reduced-motion: reduce)").matches) ? play() : skip();
 </script></body></html>"""
