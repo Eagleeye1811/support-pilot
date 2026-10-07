@@ -27,6 +27,9 @@ FILE_API = "https://api.telegram.org/file/bot{token}/{path}"
 # "send me a confirmation mail", "can you email me the details", "mail me"...
 EMAIL_REQUEST = re.compile(r"\b(e-?mail|mail)\b.*\b(send|confirm|confirmation|copy|details|me)\b|"
                            r"\b(send|confirm|confirmation)\b.*\b(e-?mail|mail)\b|^\s*(e-?mail|mail) me\b", re.I)
+# "send it", "yes please", "ok go ahead" while we wait for an email address
+GO_AHEAD = re.compile(r"^\s*(yes|yeah|yep|sure|ok|okay|please|pls|go ahead|do it|send( it| me| please)?|"
+                      r"give( me)?( it)?|share( it)?)\b", re.I)
 EMAIL_FIND = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 POLL_TIMEOUT = 10  # seconds; also how often website ticket updates are pushed to Telegram
 THREAD_NAME = "supportpilot-telegram"
@@ -173,6 +176,11 @@ class TelegramBot(WrongItemFlow):
                 return self.skip_email(doc)
             if found:  # "my email is asha@gmail.com" works as well as the bare address
                 return self.capture_email(doc, found.group(0))
+            if doc.get("contact_email") and GO_AHEAD.search(text):
+                return self.capture_email(doc, doc["contact_email"])
+            if GO_AHEAD.search(text) or EMAIL_REQUEST.search(text):  # "send it", "yes please" — still need the address
+                return self.send(doc["chat_id"], "Happy to! ✉️ Just type the email address you'd like it sent to "
+                                                 "(for example: name@gmail.com).", [[{"text": "No thanks", "callback_data": "email:skip"}]])
             doc["awaiting_email"] = False  # they moved on to something else
         if EMAIL_REQUEST.search(text) or (found and doc.get("last_ticket") and len(text.split()) <= 8):
             return self.email_request(doc, text, found.group(0) if found else None)

@@ -318,3 +318,17 @@ def test_asking_for_a_mail_in_own_words(bot, smtp):
     assert "Which email address" in texts(bot)[-1]
     bot.handle_update(message("asha.k@gmail.com"))
     assert len(smtp) == 1
+
+
+def test_send_it_while_waiting_for_the_address_reasks(bot, smtp):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(button("wi:yes"))
+    bot.handle_update(photo())
+    bot.handle_update(message("Yes give me the confirmation email"))
+    assert "type the email address" in texts(bot)[-1]
+    bot.handle_update(message("Send it"))
+    assert "type the email address" in texts(bot)[-1]  # not treated as a new problem
+    assert len(bot.store.list("tickets", where=lambda t: not t.get("historical"))) == 1
+    bot.handle_update(message("asha.k@gmail.com"))
+    assert len(smtp) == 1 and "csat:5" in str(bot.outbox[-1]["reply_markup"])
