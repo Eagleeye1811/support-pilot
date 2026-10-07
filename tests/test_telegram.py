@@ -332,3 +332,35 @@ def test_send_it_while_waiting_for_the_address_reasks(bot, smtp):
     assert len(bot.store.list("tickets", where=lambda t: not t.get("historical"))) == 1
     bot.handle_update(message("asha.k@gmail.com"))
     assert len(smtp) == 1 and "csat:5" in str(bot.outbox[-1]["reply_markup"])
+
+
+def test_a_stopping_bot_still_handles_the_messages_it_received(bot):
+    """A deploy retires the old poller mid-poll; the photo it just received must not be lost."""
+    calls = []
+
+    class RetiringBot(FakeBot):
+        def call(self, method, http_timeout=15, files=None, **params):
+            calls.append((method, params.get("offset")))
+            if method == "getMe":
+                return {"username": "supportpilot_test_bot"}
+            if method == "getUpdates" and params.get("timeout") != 0:
+                self.stop()  # told to stop while this long-poll was open
+                return [{"update_id": 900, **message("/start")}]
+            return super().call(method, http_timeout, files, **params)
+
+    old = RetiringBot(bot.store)
+    old.run()
+    assert old.outbox and "SupportPilot assistant" in old.outbox[0]["text"]  # handled, not dropped
+    assert ("getUpdates", 901) in calls  # and only then confirmed to Telegram
+
+
+def test_proceed_continues_without_a_photo(bot):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(button("wi:yes"))
+    bot.handle_update(message("Got JBL headphones instead of what I ordered"))
+    bot.handle_update(message("Proceed"))
+    chat = bot.store.get("telegram_chats", CHAT)
+    assert flow_step(bot) is None and chat["last_ticket"]
+    conv = bot.store.get("conversations", chat["conv_id"])
+    assert any("JBL" in m["text"] for m in conv["messages"] if m["role"] == "user")  # the description was kept

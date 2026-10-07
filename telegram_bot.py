@@ -349,11 +349,9 @@ class TelegramBot(WrongItemFlow):
         while not self._stop.is_set():
             try:
                 updates = self.call("getUpdates", http_timeout=POLL_TIMEOUT + 10, **self._poll_params(offset))
-                for upd in updates:
-                    offset = upd["update_id"] + 1
-                    if self._stop.is_set():
-                        break
+                for upd in updates:  # finish the whole batch even when asked to stop: Telegram already handed it to us
                     self.process(upd)
+                    offset = upd["update_id"] + 1
                 self.deliver_notifications()
                 self.status(running=True, last_poll=iso(), error=None)
             except Exception as exc:

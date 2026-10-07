@@ -27,7 +27,8 @@ from agents.shared_agent import fmt_ts, now, parse_ts
 WINDOW_DAYS = 30  # how far back to look for the order the customer means
 YES = re.compile(r"^\s*(y|yes|yeah|yep|yup|correct|right|that'?s it|that one|ok|okay|sure|haan|ha)\b", re.I)
 NO = re.compile(r"^\s*(n|no|nope|not this|wrong order|different|another)\b", re.I)
-SKIP = re.compile(r"^\s*(skip|no photo|don'?t have|can'?t|cannot|no camera)\b", re.I)
+SKIP = re.compile(r"^\s*(skip|no photo|don'?t have|can'?t|cannot|no camera|proceed|continue|go ahead|carry on|"
+                  r"done|next|move on)\b", re.I)
 
 
 class WrongItemFlow:
