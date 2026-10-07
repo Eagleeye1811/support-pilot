@@ -46,11 +46,13 @@ SAMPLE = ("CUST1001", "My order was delivered but I received the wrong item")
 
 
 @st.cache_resource
-def get_store():
+def get_store(code_version):
     return A.Store()
 
 
-store = get_store()
+# Keyed on the Store class: when a deploy hot-reloads agents/store.py, the class object changes and a fresh
+# Store (same database file) is created, instead of reusing an instance built from the old code.
+store = get_store(id(A.Store))
 bus = get_bus(store)
 tg_bot = start_telegram(store, use_llm=A.llm_enabled())  # one long-polling bot per server process; None without a token
 THEME = getattr(st.context.theme, "type", None) or "light"
