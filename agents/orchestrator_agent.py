@@ -15,6 +15,8 @@ from . import (action_agent, channel_agent, context_agent, email_agent, escalati
                memory_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent, troubleshooting_agent)
 from .shared_agent import ALWAYS_ESCALATE, AUTO_REFUND_LIMIT, CHANNELS, COMPANY, INTENTS
 
+PHOTO_INTENTS = {"wrong_item", "damaged_item", "return_request"}
+
 
 class Tracer:
     def __init__(self):
@@ -65,7 +67,7 @@ def _issue_understanding(understanding, issue, mode):
 
 
 def handle_message(store, text=None, conversation_id=None, customer_id=None, channel="web", payload=None, use_llm=True,
-                   contact_email=None):
+                   contact_email=None, attachments=None, defer_csat=False):
     """Process one inbound customer message end-to-end and return the full, traceable turn."""
     T = Tracer()
     plan = ["channel", "understand", "memory", "context", "knowledge", "troubleshoot", "escalate?", "act", "escalate",
@@ -82,7 +84,8 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     conv["channel"] = inbound["channel"]
     if contact_email:  # an address the customer gave us: the Email agent sends ticket emails there
         conv["contact_email"] = contact_email
-    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"]))
+    attachments = list(attachments or [])
+    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"], attachments=attachments))
     out = dict(conversation_id=conv["id"], channel=inbound["channel"], inbound=inbound, understanding=None, issue=None,
                mode=None, context=None, articles=[], workflow=None, investigation=None, actions=[], decision=None,
                pre_decision=None, ticket=None, review=None, llm_polished=False, email=None)
@@ -189,6 +192,11 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     else:
         investigation = T.run("4 Troubleshooting", lambda: troubleshooting_agent.investigate(store, issue["intent"], ctx, issue["slots"], articles, kb_conf=kb_conf),
                               lambda r: f"{len(r['steps'])} checks · {r['diagnosis'][:90]} · conf {r['confidence']:.0%}")
+    if attachments and issue["intent"] in PHOTO_INTENTS:  # the customer's photo is evidence for the claim
+        investigation["steps"].insert(0, dict(check="Photo evidence", status="pass",
+                                              detail=f"{len(attachments)} customer photo(s) received and attached to the case"))
+        if not investigation.get("missing_slots"):
+            investigation["confidence"] = round(min(0.99, investigation.get("confidence", 0) + 0.05), 2)
     out["investigation"] = investigation
 
     # ---- 7 escalation (pre) → 5 actions → 7 escalation (post) ------------------------
@@ -232,6 +240,9 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     for a in actions:
         a["ticket_id"] = ticket["id"]
         store.put("actions", a["id"], a)
+    if attachments:  # keep the customer's photos with the ticket for the human agent
+        ticket["attachments"] = list(dict.fromkeys((ticket.get("attachments") or []) + attachments))
+        store.put("tickets", ticket["id"], ticket)
 
     def track():
         sla = tracking_agent.sla_status(ticket)
@@ -252,7 +263,8 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     reply = response_agent.compose(decision, iu, investigation, actions, ctx, ticket, issue, articles, conv["channel"])
     if decision["decision"] == "auto_resolve":
         T.note("10 Customer Satisfaction", "CSAT requested")
-        reply += "\n\n" + satisfaction_agent.CSAT_PROMPT
+        if not defer_csat:  # guided flows ask for the rating themselves, after the email step
+            reply += "\n\n" + satisfaction_agent.CSAT_PROMPT
     if conv.get("contact_email"):
         out["email"] = T.run("Email Agent", lambda: email_agent.send_email(
             store, conv["contact_email"], "ticket", ticket["id"], reply,

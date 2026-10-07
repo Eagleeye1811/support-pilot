@@ -52,6 +52,20 @@ Notes: only one copy of the bot may poll a token at a time — stop the local ap
 use a second bot for local testing. Streamlit Cloud puts idle apps to sleep; while it sleeps the bot does not answer
 until someone opens the website. Telegram messages are visible to anyone who can open the site.
 
+### Guided wrong-item conversation (Telegram)
+A wrong-item complaint is handled as a real conversation (`telegram_wrong_item.py`), not a one-shot answer:
+1. **Find the order.** The agent finds the customer's recently delivered order and shows the product picture:
+   *"Is this the order?"* (Guests are first asked for an order ID, phone or email.)
+2. **Get a photo.** It asks for a photo of the item that arrived, with a short description. No photo? Describing it or
+   typing *skip* works.
+3. **Resolve.** The full agent pipeline runs with the photo as evidence: dispatch-scan check, replacement, free return
+   pickup and a ticket ID.
+4. **Email.** It offers a confirmation email, or sends it immediately if the address is known.
+5. **Rate.** Only then does it ask for a ⭐ rating.
+
+Asking for a mail in your own words ("send me a confirmation mail") works at any point. Changing the subject mid-way
+hands over to the normal flow.
+
 ## Email agent (real email)
 `agents/email_agent.py` sends real email through Gmail SMTP.
 - **Setup:** set `SMTP_USER` (the Gmail address that sends) and `SMTP_PASSWORD` (a Google **App Password**: Google Account

@@ -7,10 +7,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["SUPPORTPILOT_DISABLE_LLM"] = "1"
 
 import agents as A  # noqa: E402
-from agent_flow import build_flow  # noqa: E402
 from telegram_bot import TelegramBot  # noqa: E402
 
 CHAT = 777
+JPEG = b"\xff\xd8\xff\xe0" + b"0" * 2000
 
 
 class FakeBot(TelegramBot):
@@ -20,10 +20,16 @@ class FakeBot(TelegramBot):
         super().__init__(store, "TEST", use_llm=False)
         self.outbox = []
 
-    def call(self, method, http_timeout=15, **params):
-        if method == "sendMessage":
-            self.outbox.append(params)
+    def call(self, method, http_timeout=15, files=None, **params):
+        if method in ("sendMessage", "sendPhoto"):
+            self.outbox.append(dict(params, method=method, files=sorted(files or {}),
+                                    text=params.get("text") or params.get("caption", "")))
+        if method == "getFile":
+            return {"file_path": "photos/x.jpg"}
         return {}
+
+    def download(self, file_id):
+        return JPEG
 
 
 def message(text):
@@ -44,24 +50,6 @@ def test_start_offers_demo_customers(bot):
     keyboard = bot.outbox[-1]["reply_markup"]["inline_keyboard"]
     assert any(b[0]["callback_data"] == "login:CUST1001" for b in keyboard)
     assert keyboard[-1][0]["callback_data"] == "login:guest"
-
-
-def test_issue_is_resolved_rated_and_recorded_for_the_website(bot):
-    bot.handle_update(button("login:CUST1001"))
-    bot.handle_update(message("My order was delivered but I received the wrong item"))
-    reply = bot.outbox[-1]
-    assert "csat:5" in str(reply["reply_markup"])  # star buttons offered after auto-resolution
-    chat = bot.store.get("telegram_chats", CHAT)
-    assert chat["customer_id"] == "CUST1001" and chat["conv_id"]
-    turn = bot.store.list("telegram_turns", chat_id=CHAT)[0]
-    flow = build_flow(turn["text"], turn["result"])
-    assert flow["outcome"] == "Resolved automatically" and flow["ticket"]
-    ticket = bot.store.get("tickets", flow["ticket"])
-    assert ticket["channel"] == "telegram"
-
-    bot.handle_update(button("csat:5"))
-    assert "Thank you" in bot.outbox[-1]["text"]
-    assert bot.store.get("tickets", ticket["id"])["status"] == "Closed"
 
 
 def test_website_ticket_update_reaches_the_chat_once(bot):
@@ -127,7 +115,7 @@ def test_email_capture_sends_the_ticket_and_later_website_updates(bot, smtp):
     assert EMAIL_OFFER in texts(bot)[-1]
     tid = bot.store.get("telegram_chats", CHAT)["last_ticket"]
     bot.handle_update(message("asha.k@gmail.com"))
-    assert "Sent the ticket details to a***@gmail.com" in texts(bot)[-1]
+    assert "on its way to a***@gmail.com" in texts(bot)[-1]
     assert len(smtp) == 1 and tid in smtp[0]["Subject"]
 
     A.transition(bot.store, tid, "Resolved", actor="Human Agent", note="Card blocked and money returned")
@@ -135,15 +123,6 @@ def test_email_capture_sends_the_ticket_and_later_website_updates(bot, smtp):
     bot.deliver_notifications()
     assert sum(t.startswith("🔔") for t in texts(bot)) == 1
     assert len(smtp) == 2 and "Update: Resolved" in smtp[1]["Subject"]
-
-
-def test_next_tickets_are_emailed_automatically(bot, smtp):
-    bot.handle_update(button("login:CUST1001"))
-    bot.handle_update(message("/email asha.k@gmail.com"))
-    assert "Saved a***@gmail.com" in texts(bot)[-1] and not smtp
-    bot.handle_update(message("My order was delivered but I received the wrong item"))
-    assert len(smtp) == 1
-    assert {p["Content-ID"] for p in smtp[0].walk() if p.get_content_type() == "image/png"} == {"<EL-200>", "<EL-110>"}
 
 
 def test_email_offer_once_per_chat_and_skip(bot):
@@ -216,3 +195,126 @@ def test_bots_from_earlier_versions_are_retired(monkeypatch):
     legacy.join(2)
     assert not legacy.is_alive()
     new.stop()
+
+
+# ---- guided wrong-item conversation ------------------------------------------------------------
+def photo(caption=""):
+    msg = {"chat": {"id": CHAT}, "from": {"first_name": "Asha"},
+           "photo": [{"file_id": "small", "width": 90}, {"file_id": "big", "width": 800}]}
+    if caption:
+        msg["caption"] = caption
+    return {"message": msg}
+
+
+def flow_step(bot):
+    return (bot.store.get("telegram_chats", CHAT).get("flow") or {}).get("step")
+
+
+def test_wrong_item_full_guided_flow(bot, smtp):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("Hi, I got the wrong product in my delivery"))
+    # 1 · the agent finds the order and shows the product it detected
+    shown = bot.outbox[-1]
+    assert shown["method"] == "sendPhoto" and shown["files"] == ["photo"]
+    assert "ORD12345" in shown["text"] and "Headphones" in shown["text"]
+    assert "wi:yes" in str(shown["reply_markup"]) and flow_step(bot) == "confirm"
+    assert not bot.store.list("tickets", customer_id="CUST1001", where=lambda t: not t.get("historical"))
+
+    # 2 · confirmed → asks for a photo of what arrived
+    bot.handle_update(button("wi:yes"))
+    assert "photo of the item you received" in texts(bot)[-1] and flow_step(bot) == "photo"
+
+    # 3 · photo + description → the full pipeline runs: ticket, replacement, no rating yet
+    bot.handle_update(photo("Got blue earbuds instead of the headphones"))
+    assert flow_step(bot) is None
+    chat = bot.store.get("telegram_chats", CHAT)
+    ticket = bot.store.get("tickets", chat["last_ticket"])
+    assert ticket["status"] == "Resolved" and ticket["attachments"] == [bot.store.list("attachments")[0]["id"]]
+    assert "Create Replacement" in " ".join(ticket["actions_taken"])
+    resolution = next(m for m in bot.outbox if ticket["id"] in m["text"] and m["method"] == "sendMessage")
+    assert "reply_markup" not in resolution and "rate" not in resolution["text"].lower()
+    assert "confirmation email" in texts(bot)[-1]  # 4 · email is offered before any rating
+    turn = bot.store.list("telegram_turns", chat_id=CHAT)
+    assert any(t["result"].get("investigation", {}).get("steps", [{}])[0].get("check") == "Photo evidence" for t in turn)
+
+    # 4 · email → sent with ordered vs received images, then 5 · the rating
+    bot.handle_update(message("my email is asha.k@gmail.com"))
+    assert len(smtp) == 1 and ticket["id"] in smtp[0]["Subject"]
+    assert "on its way to a***@gmail.com" in texts(bot)[-2]
+    assert "csat:5" in str(bot.outbox[-1]["reply_markup"])
+    bot.handle_update(button("csat:5"))
+    assert "Thank you" in texts(bot)[-1]
+    assert bot.store.get("tickets", ticket["id"])["status"] == "Closed"
+
+    # the conversation transcript holds the whole dialog for the human agent
+    conv = bot.store.get("conversations", chat["conv_id"])
+    assert any("is this the order" in m["text"].lower() for m in conv["messages"])
+
+
+def test_guest_is_asked_for_the_order_first(bot):
+    bot.handle_update(message("/guest"))
+    bot.handle_update(message("I received the wrong item"))
+    assert "order ID" in texts(bot)[-1] and flow_step(bot) == "identify"
+    bot.handle_update(message("it's ORD12345"))
+    assert bot.outbox[-1]["method"] == "sendPhoto" and "ORD12345" in bot.outbox[-1]["text"]
+    assert bot.store.get("telegram_chats", CHAT)["customer_id"] == "CUST1001"
+
+
+def test_known_email_is_used_and_rating_follows(bot, smtp):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("/email asha.k@gmail.com"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(button("wi:yes"))
+    bot.handle_update(message("skip"))  # no photo
+    assert len(smtp) == 1  # confirmation sent automatically with the ticket
+    assert "Confirmation email sent to a***@gmail.com" in texts(bot)[-2]
+    assert "csat:5" in str(bot.outbox[-1]["reply_markup"])
+
+
+def test_skip_email_then_rating(bot):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(button("wi:yes"))
+    bot.handle_update(photo())
+    bot.handle_update(button("email:skip"))
+    assert "keep you updated here" in texts(bot)[-2] and "csat:5" in str(bot.outbox[-1]["reply_markup"])
+
+
+def test_description_without_photo_asks_once_more(bot):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(message("yes"))
+    bot.handle_update(message("I got wireless earbuds instead"))
+    assert "attach a *photo*" in texts(bot)[-1] and flow_step(bot) == "photo"
+    bot.handle_update(message("don't have one"))
+    assert flow_step(bot) is None and bot.store.get("telegram_chats", CHAT)["last_ticket"]
+
+
+def test_photo_first_then_complaint(bot):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(photo())
+    assert "What went wrong" in texts(bot)[-1]
+    bot.handle_update(message("wrong item delivered"))
+    bot.handle_update(button("wi:yes"))  # the earlier photo is used — no second request
+    ticket = bot.store.get("tickets", bot.store.get("telegram_chats", CHAT)["last_ticket"])
+    assert ticket["attachments"]
+
+
+def test_different_order_and_changing_topic(bot):
+    bot.handle_update(button("login:CUST1001"))
+    bot.handle_update(message("I received the wrong item"))
+    bot.handle_update(button("wi:other"))
+    assert "order ID" in texts(bot)[-1]
+    bot.handle_update(message("Actually my account is locked, I can't login"))
+    assert flow_step(bot) is None  # moved on: handled by the normal flow
+    assert bot.store.get("telegram_chats", CHAT)["last_ticket"]
+
+
+def test_asking_for_a_mail_in_own_words(bot, smtp):
+    bot.handle_update(button("login:CUST1003"))
+    bot.handle_update(message("I can't login, it says my account is locked"))
+    bot.handle_update(message("skip"))
+    bot.handle_update(message("can you send me a confirmation mail?"))
+    assert "Which email address" in texts(bot)[-1]
+    bot.handle_update(message("asha.k@gmail.com"))
+    assert len(smtp) == 1
