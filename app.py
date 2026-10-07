@@ -5,6 +5,7 @@ import plotly.express as px
 import streamlit as st
 
 import agents as A
+from agent_flow import render_flow
 from agents.shared_agent import fmt_ts, humanize_minutes
 
 st.set_page_config(page_title="SupportPilot - Agentic Customer Support", page_icon=":material/support_agent:", layout="wide")
@@ -165,6 +166,9 @@ def step_lines(steps):
         st.markdown(f"{STEP_ICON.get(s['status'], '•')} **{s['check']}** — {s['detail']}")
 
 
+THEME = getattr(st.context.theme, "type", None) or "light"
+
+
 # ---- 1 chat ------------------------------------------------------------------------------------------
 with tabs[0]:
     left, right = st.columns([1.25, 1], gap="large")
@@ -192,68 +196,71 @@ with tabs[0]:
 
     with right:
         if not last:
-            st.info("The live reasoning of every agent appears here after the first message.", icon=":material/psychology:")
+            st.info("Send a message and watch every agent pick it up, stage by stage, right here.", icon=":material/psychology:")
         else:
-            u = last.get("understanding")
-            d = last.get("decision")
-            ctx = last.get("context")
-            if u:
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">1 · Conversation understanding</div>', unsafe_allow_html=True)
-                    with st.container(horizontal=True):
-                        st.badge(u["intent"], color="violet")
-                        st.badge(u["category"], color="blue")
-                        st.badge(f"priority {u['priority']}", color=PRIORITY_COLOR.get(u["priority"], "gray"))
-                        st.badge(f"{u['emotion']} ({u['sentiment_score']:+.2f})",
-                                 color="red" if u["emotion"] == "angry" else ("orange" if u["sentiment"] == "negative" else "green"))
-                        st.badge(f"conf {u['confidence']:.0%}", color="gray")
-                    st.code(json.dumps({"intent": u["intent"], "category": u["category"], "priority": u["priority"],
-                                        "sentiment": u["sentiment"], "entities": u["entities"]}), language="json")
-                    if last.get("issue"):
-                        iss = last["issue"]
-                        st.caption(f"Memory: **{last['mode']}** · issue {iss['intent']} · status **{iss['status']}** · "
-                                   f"slots {iss.get('slots') or '{}'}")
-            if ctx:
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">2 · Customer context</div>', unsafe_allow_html=True)
-                    st.markdown(f"**{ctx['name']}** — {ctx['headline']}")
-                    if ctx["flags"]:
-                        st.caption(" · ".join(ctx["flags"]))
-            if last.get("investigation"):
-                inv = last["investigation"]
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">3–4 · Knowledge & troubleshooting</div>', unsafe_allow_html=True)
-                    if last.get("articles"):
-                        st.caption("KB: " + " · ".join(f"{a['id']} {a['title']} ({a['relevance']:.0%})" for a in last["articles"][:3]))
-                    if last.get("workflow"):
-                        st.caption(f"Selected workflow: **{last['workflow']['title']}** (reliability {last['workflow']['reliability']:.0%})")
-                    step_lines(inv["steps"])
-                    st.markdown(f"**Diagnosis:** {inv['diagnosis']}")
-            if last.get("actions"):
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">5 · Actions executed</div>', unsafe_allow_html=True)
-                    for a in last["actions"]:
-                        icon = {"success": "✅", "skipped": "↩️", "blocked": "⛔", "failed": "❌"}[a["status"]]
-                        st.markdown(f"{icon} **{a['label']}** ({a['status']}) — {a['message']}")
-            if isinstance(d, dict):
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">7 · Escalation decision</div>', unsafe_allow_html=True)
-                    label = {"auto_resolve": "✅ Auto-resolved", "escalate": "🧑‍💼 Escalated", "clarify": "💬 Clarifying"}[d["decision"]]
-                    st.markdown(f"**{label}** — confidence **{d['confidence']:.0%}** vs threshold **{d['threshold']:.0%}**"
-                                + (" (angry customer → stricter)" if d.get("sentiment_adjusted") else ""))
-                    st.progress(min(d["confidence"], 1.0))
-                    for r in d["reasons"]:
-                        st.caption(f"• {r}")
-            if last.get("ticket"):
-                t = last["ticket"]
-                with st.container(border=True):
-                    st.markdown('<div class="sp-card-title">8–9 · Ticket & tracking</div>', unsafe_allow_html=True)
-                    st.markdown(f"🎫 **{t['id']}** — {t['title']} · **{t['status']}** · {t.get('assignee')} ({t.get('team')})")
-                    with st.expander("Full ticket (what the human agent sees)"):
-                        st.markdown(A.render_ticket(store.get("tickets", t["id"]) or t))
-            if last.get("reply_channel") and ss.channel != "web":
-                with st.expander(f"Reply as delivered on {A.CHANNELS[ss.channel]}"):
-                    st.code(last["reply_channel"], language=None, wrap_lines=True)
+            st.markdown('<div class="sp-card-title">Live agent flow</div>', unsafe_allow_html=True)
+            render_flow(ss.turns[-1]["text"], last, theme=THEME, height=700)
+            with st.expander("Detailed agent outputs", icon=":material/data_object:"):
+                u = last.get("understanding")
+                d = last.get("decision")
+                ctx = last.get("context")
+                if u:
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">1 · Conversation understanding</div>', unsafe_allow_html=True)
+                        with st.container(horizontal=True):
+                            st.badge(u["intent"], color="violet")
+                            st.badge(u["category"], color="blue")
+                            st.badge(f"priority {u['priority']}", color=PRIORITY_COLOR.get(u["priority"], "gray"))
+                            st.badge(f"{u['emotion']} ({u['sentiment_score']:+.2f})",
+                                     color="red" if u["emotion"] == "angry" else ("orange" if u["sentiment"] == "negative" else "green"))
+                            st.badge(f"conf {u['confidence']:.0%}", color="gray")
+                        st.code(json.dumps({"intent": u["intent"], "category": u["category"], "priority": u["priority"],
+                                            "sentiment": u["sentiment"], "entities": u["entities"]}), language="json")
+                        if last.get("issue"):
+                            iss = last["issue"]
+                            st.caption(f"Memory: **{last['mode']}** · issue {iss['intent']} · status **{iss['status']}** · "
+                                       f"slots {iss.get('slots') or '{}'}")
+                if ctx:
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">2 · Customer context</div>', unsafe_allow_html=True)
+                        st.markdown(f"**{ctx['name']}** — {ctx['headline']}")
+                        if ctx["flags"]:
+                            st.caption(" · ".join(ctx["flags"]))
+                if last.get("investigation"):
+                    inv = last["investigation"]
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">3–4 · Knowledge & troubleshooting</div>', unsafe_allow_html=True)
+                        if last.get("articles"):
+                            st.caption("KB: " + " · ".join(f"{a['id']} {a['title']} ({a['relevance']:.0%})" for a in last["articles"][:3]))
+                        if last.get("workflow"):
+                            st.caption(f"Selected workflow: **{last['workflow']['title']}** (reliability {last['workflow']['reliability']:.0%})")
+                        step_lines(inv["steps"])
+                        st.markdown(f"**Diagnosis:** {inv['diagnosis']}")
+                if last.get("actions"):
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">5 · Actions executed</div>', unsafe_allow_html=True)
+                        for a in last["actions"]:
+                            icon = {"success": "✅", "skipped": "↩️", "blocked": "⛔", "failed": "❌"}[a["status"]]
+                            st.markdown(f"{icon} **{a['label']}** ({a['status']}) — {a['message']}")
+                if isinstance(d, dict):
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">7 · Escalation decision</div>', unsafe_allow_html=True)
+                        label = {"auto_resolve": "✅ Auto-resolved", "escalate": "🧑‍💼 Escalated", "clarify": "💬 Clarifying"}[d["decision"]]
+                        st.markdown(f"**{label}** — confidence **{d['confidence']:.0%}** vs threshold **{d['threshold']:.0%}**"
+                                    + (" (angry customer → stricter)" if d.get("sentiment_adjusted") else ""))
+                        st.progress(min(d["confidence"], 1.0))
+                        for r in d["reasons"]:
+                            st.caption(f"• {r}")
+                if last.get("ticket"):
+                    t = last["ticket"]
+                    with st.container(border=True):
+                        st.markdown('<div class="sp-card-title">8–9 · Ticket & tracking</div>', unsafe_allow_html=True)
+                        st.markdown(f"🎫 **{t['id']}** — {t['title']} · **{t['status']}** · {t.get('assignee')} ({t.get('team')})")
+                        with st.expander("Full ticket (what the human agent sees)"):
+                            st.markdown(A.render_ticket(store.get("tickets", t["id"]) or t))
+                if last.get("reply_channel") and ss.channel != "web":
+                    with st.expander(f"Reply as delivered on {A.CHANNELS[ss.channel]}"):
+                        st.code(last["reply_channel"], language=None, wrap_lines=True)
 
 # ---- 2 trace -------------------------------------------------------------------------------------------
 FLOW = [("0", "Omnichannel\nadapter"), ("1", "Understanding"), ("6", "Memory"), ("2", "Customer\ncontext"), ("3", "Knowledge"),
@@ -279,15 +286,12 @@ def flow_dot(trace):
 
 with tabs[1]:
     if not ss.turns:
-        st.info("Send a message to see the orchestrator's plan, every agent's output, timings and the reviewer guardrail.")
+        st.info("Send a message in Customer chat — then pick any turn here to replay how the agents handled it.")
     else:
         idx = st.selectbox("Turn", range(len(ss.turns)), index=len(ss.turns) - 1,
                            format_func=lambda i: f"{i + 1}. {ss.turns[i]['text'][:80]}")
         r = ss.turns[idx]["result"]
-        st.graphviz_chart(flow_dot(r["trace"]), width="stretch")
-        st.caption("Blue = agents that ran on this turn (the planner skips agents the turn does not need).")
-        st.dataframe(pd.DataFrame(r["trace"]), hide_index=True, width="stretch",
-                     column_config={"ms": st.column_config.NumberColumn("ms", format="%.1f")})
+        render_flow(ss.turns[idx]["text"], r, theme=THEME, height=760)
         c1, c2 = st.columns(2)
         with c1:
             st.markdown('<div class="sp-card-title">Reviewer guardrail</div>', unsafe_allow_html=True)
@@ -298,6 +302,11 @@ with tabs[1]:
                 st.markdown('<div class="sp-card-title">Escalation rules evaluated</div>', unsafe_allow_html=True)
                 for h in r["decision"]["rule_hits"]:
                     st.markdown(f"{'🔺' if h['triggered'] else '▫️'} {h['rule']}" + (f" — {h['detail']}" if h["triggered"] and h["detail"] else ""))
+        with st.expander("Pipeline map and raw timings", icon=":material/table:"):
+            st.graphviz_chart(flow_dot(r["trace"]), width="stretch")
+            st.caption("Blue = agents that ran on this turn (the planner skips agents the turn does not need).")
+            st.dataframe(pd.DataFrame(r["trace"]), hide_index=True, width="stretch",
+                         column_config={"ms": st.column_config.NumberColumn("ms", format="%.1f")})
         with st.expander("Structured turn output (same JSON the MCP server returns)"):
             st.json(A.summarize_turn(dict(r, conversation={})), expanded=False)
 
