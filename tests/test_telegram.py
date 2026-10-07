@@ -130,7 +130,7 @@ def test_email_offer_once_per_chat_and_skip(bot):
     bot.handle_update(button("login:CUST1003"))
     bot.handle_update(message("I can't login, it says my account is locked"))
     bot.handle_update(message("skip"))
-    assert "keep you updated here" in texts(bot)[-1]
+    assert "keep you updated here" in texts(bot)[-2] and "csat:5" in str(bot.outbox[-1]["reply_markup"])
     bot.handle_update(message("/new"))
     bot.handle_update(message("I can't login, it says my account is locked"))
     assert sum(EMAIL_OFFER in t for t in texts(bot)) == 1
@@ -364,3 +364,17 @@ def test_proceed_continues_without_a_photo(bot):
     assert flow_step(bot) is None and chat["last_ticket"]
     conv = bot.store.get("conversations", chat["conv_id"])
     assert any("JBL" in m["text"] for m in conv["messages"] if m["role"] == "user")  # the description was kept
+
+
+def test_rating_comes_after_the_email_for_any_issue(bot, smtp):
+    bot.handle_update(button("login:CUST1003"))
+    bot.handle_update(message("I can't login, it says my account is locked"))
+    reply = bot.outbox[-1]
+    assert "reply_markup" not in reply and "rate this support" not in reply["text"].lower()  # no stars before the email
+    bot.handle_update(message("asha.k@gmail.com"))
+    assert len(smtp) == 1
+    assert "on its way" in texts(bot)[-2] and "csat:5" in str(bot.outbox[-1]["reply_markup"])
+    bot.handle_update(button("csat:4"))
+    assert "Thank you" in texts(bot)[-1]
+    bot.handle_update(message("/email asha.k@gmail.com"))  # already rated: no second rating request
+    assert "csat" not in str(bot.outbox[-1].get("reply_markup"))

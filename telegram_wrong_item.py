@@ -237,9 +237,14 @@ class WrongItemFlow:
                                          "Reply with your email address.", [[{"text": "No thanks", "callback_data": "email:skip"}]])
 
     def ask_rating(self, doc):
-        if not doc.pop("rating_pending", False):
-            self.save_chat(doc)
-            return None
+        """After the email step: ask for a rating if the resolved ticket has not been rated yet.
+
+        Decided from the conversation itself (it waits for a CSAT after an automatic resolution),
+        so it holds for every issue type and survives restarts."""
+        doc.pop("rating_pending", None)
         self.save_chat(doc)
+        conv = self.store.get("conversations", doc["conv_id"]) if doc.get("conv_id") else None
+        if not conv or conv.get("awaiting") != "csat":
+            return None
         return self.send(doc["chat_id"], "One last thing — how would you rate this support experience?",
                          [[{"text": "⭐" * i, "callback_data": f"csat:{i}"} for i in range(1, 6)]])

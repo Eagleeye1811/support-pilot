@@ -227,6 +227,8 @@ class TelegramBot(WrongItemFlow):
         payload = dict(message=dict(text=text, chat={"id": doc["chat_id"]},
                                     **{"from": (msg or {}).get("from") or {"username": doc.get("username")}}))
         before = iso()
+        will_offer = offer_email and not doc.get("contact_email") and not doc.get("email_offered")
+        defer_csat = defer_csat or will_offer  # the rating comes after the email question, not before it
         r = A.handle_message(self.store, conversation_id=doc["conv_id"], customer_id=doc["customer_id"], channel="telegram",
                              payload=payload, use_llm=self.use_llm, contact_email=doc.get("contact_email"),
                              attachments=attachments, defer_csat=defer_csat)
