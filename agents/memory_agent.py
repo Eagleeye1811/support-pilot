@@ -99,7 +99,8 @@ def open_issue(conv, understanding, text):
     if conv.get("active_issue"):
         conv["issues"].append(conv["active_issue"])
     issue = _new_issue(dict(understanding, entities={k: v for k, v in understanding["entities"].items() if k in SLOT_ENTITY_KEYS}))
-    issue.update(first_message=text, confidence=understanding["confidence"], emotion=understanding.get("emotion", "calm"))
+    issue.update(first_message=text, confidence=understanding["confidence"], emotion=understanding.get("emotion", "calm"),
+                 source=understanding.get("source", "rules"))
     conv["active_issue"] = issue
     conv["clarification_count"] = 0
     return issue

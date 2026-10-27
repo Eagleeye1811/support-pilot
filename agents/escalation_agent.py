@@ -8,6 +8,7 @@ evaluates explicit rules, every one of which is reported for transparency:
   * required information still missing → clarify (escalate after 2 failed attempts)
   * investigation says not auto-resolvable (high-value, policy exception, security hold)
   * any executed action failed or was blocked by a guardrail
+  * an action is waiting for human approval (policy: refund limit / tenant approval mode)
   * confidence below the threshold (70% base, learned per intent from CSAT)
   * sentiment-aware: angry customers get a stricter threshold and repeat
     contacts escalate faster
@@ -41,6 +42,7 @@ def decide(understanding, investigation, ctx, issue, actions=None, thresholds=No
         repeat = ctx["previous_tickets"]["intents"].count(intent)
     turns = issue.get("turns", 1) if issue else 1
     failed = [a for a in (actions or []) if a["status"] in ("failed", "blocked") and not a.get("fallback_recovered")]
+    waiting = [a for a in (actions or []) if a["status"] == "pending_approval"]
 
     rules = [
         ("Mandatory escalation (fraud / breach / legal)", intent in ALWAYS_ESCALATE, spec["label"]),
@@ -48,6 +50,7 @@ def decide(understanding, investigation, ctx, issue, actions=None, thresholds=No
         ("Required details missing", bool(investigation.get("missing_slots")), ", ".join(investigation.get("missing_slots", []))),
         ("Investigation not auto-resolvable", not investigation.get("resolvable", True), investigation.get("diagnosis", "")),
         ("Action failed / blocked by guardrail", bool(failed), "; ".join(a["message"] for a in failed)),
+        ("Action needs human approval", bool(waiting), "; ".join(a["message"] for a in waiting)),
         (f"Confidence below threshold ({threshold:.0%})", conf < threshold and not investigation.get("missing_slots"),
          f"confidence {conf:.0%}"
          + (f"; threshold learned from {learned['reason']}" if learned.get("reason", "default") != "default" and "escalate more" in learned.get("reason", "") else "")),

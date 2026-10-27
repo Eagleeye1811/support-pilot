@@ -1,13 +1,12 @@
-"""SupportPilot shared layer: intent taxonomy, SLA policy, time/text helpers and optional Groq LLM access.
+"""SupportPilot shared layer: intent taxonomy, SLA policy, time/text helpers and settings.
 
 Every agent imports from here so the taxonomy, priorities and SLA rules have a
-single source of truth. The LLM is optional: all decisions are deterministic,
-the LLM may only re-phrase or break ties, and its output is always validated.
+single source of truth. LLM access lives in ``agents/llm.py``; the wrappers at
+the bottom keep the older ``groq_chat`` / ``groq_json`` helpers working.
 """
 from __future__ import annotations
 
 import datetime as dt
-import json
 import os
 import re
 import uuid
@@ -306,50 +305,17 @@ def get_groq_api_key():
 
 
 def llm_enabled():
-    return os.getenv("SUPPORTPILOT_DISABLE_LLM", "").lower() not in ("1", "true", "yes") and bool(get_groq_api_key())
+    from . import llm
+    return llm.enabled()
 
 
 def groq_chat(prompt, system_msg=None, model=None, api_key=None, max_tokens=400, json_mode=False):
-    if os.getenv("SUPPORTPILOT_DISABLE_LLM", "").lower() in ("1", "true", "yes"):
-        return None
-    api_key = api_key or get_groq_api_key()
-    if not api_key:
-        return None
-    model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_msg or "You are a careful customer support assistant. Never invent facts."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    try:
-        import requests
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return None
+    """Back-compat wrapper over ``agents.llm.chat``: the reply text, or None on any failure."""
+    from . import llm
+    res = llm.chat(prompt, system_msg=system_msg, max_tokens=max_tokens, json_mode=json_mode, purpose="chat")
+    return res.text if res.ok else None
 
 
 def groq_json(prompt, system_msg=None):
-    raw = groq_chat(prompt, system_msg=system_msg, json_mode=True, max_tokens=300)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        match = re.search(r"\{.*\}", raw, re.S)
-        try:
-            return json.loads(match.group(0)) if match else None
-        except Exception:
-            return None
+    from . import llm
+    return llm.chat_json(prompt, system_msg=system_msg, purpose="json")[1]

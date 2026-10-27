@@ -104,6 +104,11 @@ class Store:
         self.put("meta", "seed", {"id": "seed", "seeded_at": iso(), "anchor": world.get("anchor")})
         return self
 
+    def collections(self):
+        """[(collection, records, last_updated)] — what is stored in this file."""
+        with self._lock:
+            return self.conn.execute("SELECT collection, COUNT(*), MAX(updated) FROM docs GROUP BY collection ORDER BY collection").fetchall()
+
     def stats(self):
         with self._lock:
             rows = self.conn.execute("SELECT collection, COUNT(*) FROM docs GROUP BY collection").fetchall()

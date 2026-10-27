@@ -44,7 +44,9 @@ mcp = _Server("supportpilot", instructions=INSTRUCTIONS)
 
 
 def store():
-    return A.get_store()
+    """The tenant workspace this MCP server serves (SUPPORTPILOT_TENANT, default: the DemoStore simulation)."""
+    from agents.tenancy import get_registry
+    return get_registry().workspace(os.getenv("SUPPORTPILOT_TENANT", "demostore"))
 
 
 def _ticket_view(t):
@@ -133,6 +135,10 @@ def support_troubleshoot(intent: str, customer_id: str, order_id: Optional[str] 
 def support_execute_action(action: str, customer_id: str, params: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Action Execution Agent: run one guarded action (allow-list, ownership check, AI refund limit ₹10,000, idempotency).
 
+    Requested by you (an external AI client), so sensitive actions — refunds, cancellations, replacements,
+    subscription changes — are not executed directly: they return status "pending_approval" and wait for a
+    human in the SupportPilot dashboard or API. Never tell the customer such an action is done.
+
     Args:
         action: e.g. initiate_refund, create_replacement, generate_return_label, cancel_order, unlock_account,
                 reset_password, retry_subscription_sync, upgrade_plan, schedule_technician_visit. See support_list_actions.
@@ -144,7 +150,7 @@ def support_execute_action(action: str, customer_id: str, params: Optional[dict[
         raise ToolError(f"Customer {customer_id} not found")
     p = dict(params or {})
     p.setdefault("customer_id", customer_id)
-    return A.execute_action(store(), action, p, ctx, actor="AI")
+    return A.execute_action(store(), action, p, ctx, actor="AI:mcp")
 
 
 @mcp.tool()
@@ -237,11 +243,27 @@ def support_dashboard_metrics() -> dict[str, Any]:
 
 
 @mcp.tool()
+def support_get_workflow_run(run_id: str) -> dict[str, Any]:
+    """Workflow run record: agent steps, tool calls against the company system, LLM calls and outcome."""
+    run = store().get("workflow_runs", run_id)
+    if not run:
+        raise ToolError(f"Run {run_id} not found")
+    return run
+
+
+@mcp.tool()
+def support_list_approvals(status: str = "pending") -> list[dict[str, Any]]:
+    """Actions waiting for (or decided by) a human approver. Read-only: approvals are decided by humans only."""
+    return sorted(store().list("approvals", status=status), key=lambda a: a["id"])
+
+
+@mcp.tool()
 def support_reset_demo_data(confirm: bool = False) -> dict[str, Any]:
     """Wipe all tickets/conversations/actions and re-seed the synthetic demo world. Requires confirm=true."""
     if not confirm:
         return {"reset": False, "message": "Pass confirm=true to wipe and re-seed the demo data."}
     store().reset()
+    A.audit.log(store(), "demo.reset", "mcp")
     return {"reset": True, "collections": store().stats()}
 
 

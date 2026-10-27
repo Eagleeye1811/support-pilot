@@ -57,10 +57,10 @@ print(f"Latency per turn: median {statistics.median(latencies):.1f} ms, max {max
 
 # 3. guardrail probes
 ctx = A.customer_context(store, "CUST1012")
-blocked = A.execute_action(store, "initiate_refund", {"order_id": "ORD12353"}, ctx)[0]["status"] == "blocked"
+blocked = A.execute_action(store, "initiate_refund", {"order_id": "ORD12353"}, ctx)[0]["status"] == "pending_approval"
 mandatory = all(A.run_conversation(store, [m], c)[0]["decision"]["decision"] == "escalate" for m, c in
                 [("fraud on my account", "CUST1008"), ("my data was leaked", "CUST1002"), ("legal notice coming", "CUST1003")])
-print(f"\nGuardrails: refund-limit block={blocked}, mandatory escalations honoured={mandatory}")
+print(f"\nGuardrails: over-limit refund held for human approval={blocked}, mandatory escalations honoured={mandatory}")
 
 # 4. operations
 inc = A.detect_incidents(store)

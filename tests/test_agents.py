@@ -139,8 +139,12 @@ def test_human_request_escalates(store):
 # ---- guardrails ------------------------------------------------------------------------------------
 def test_ai_refund_limit_is_enforced(store):
     ctx = A.customer_context(store, "CUST1012")
+    refunds_before = len(store.list("refunds"))
     res = A.execute_action(store, "initiate_refund", {"order_id": "ORD12353"}, ctx)
-    assert res[0]["status"] == "blocked"
+    # over the AI limit: not executed, queued for a human instead
+    assert res[0]["status"] == "pending_approval"
+    assert len(store.list("refunds")) == refunds_before
+    assert store.get("approvals", res[0]["data"]["approval_id"])["status"] == "pending"
 
 
 def test_actions_are_idempotent(store):

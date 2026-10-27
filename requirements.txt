@@ -5,3 +5,10 @@ plotly
 requests
 python-dotenv
 mcp>=1.2
+fastapi>=0.115
+uvicorn>=0.30
+scikit-learn>=1.4   # Phase 2 predictive models (brings scipy for statistical tests)
+scipy
+# tests only (FastAPI TestClient)
+httpx
+pytest

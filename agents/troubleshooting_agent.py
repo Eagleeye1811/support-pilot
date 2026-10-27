@@ -13,6 +13,18 @@ from .shared_agent import AUTO_REFUND_LIMIT, HIGH_VALUE_CLAIM, INTENTS, fmt_ts, 
 
 RETURN_WINDOW = {"Electronics": 10, "Fashion": 30, "Home": 15, "Books": 10, "Beauty": 7, "Grocery": 3}
 SELLER_ERROR_WINDOW = 30
+PREMIUM_RETURN_WINDOW = 30
+LOCK_THRESHOLD = 5                          # failed password attempts before the account locks
+DELAY_COUPON = {"Premium": 200, "default": 100}  # ₹ apology coupon when an order is ≥ 1 day past its ETA
+PERISHABLE = {"Beauty", "Grocery"}  # keep their standard window for every tier (hygiene / freshness)
+
+
+def return_window(category, tier=None):
+    """Change-of-mind return window in days (KB-001): Nova Premium gets 30 days except perishable categories."""
+    window = RETURN_WINDOW.get(category, 15)
+    if tier == "Premium" and category not in PERISHABLE:
+        window = max(window, PREMIUM_RETURN_WINDOW)
+    return window
 PLAN_RANK = {"Basic": 0, "Plus": 1, "Premium": 2}
 NEEDS_IDENTITY = set(INTENTS) - {"general_inquiry", "legal_request", "human_agent", "ticket_status"}
 
@@ -26,8 +38,10 @@ class _Run:
     def step(self, check, status, detail):
         self.res["steps"].append(dict(check=check, status=status, detail=detail))
 
-    def act(self, action, why, protective=False, **params):
-        self.res["recommended_actions"].append(dict(action=action, params=params, reason=why, protective=protective))
+    def act(self, action, why, protective=False, approval=False, **params):
+        """Recommend an action. ``protective`` ones run even when escalating; ``approval`` ones are then queued for a human."""
+        self.res["recommended_actions"].append(dict(action=action, params=params, reason=why, protective=protective,
+                                                    approval=approval))
 
     def done(self, diagnosis, confidence, resolvable=True, team=None):
         self.res.update(diagnosis=diagnosis, confidence=round(confidence, 2), resolvable=resolvable)
@@ -226,15 +240,18 @@ def _refund_request(r):
         r.step("Check order status", "info", "In transit — refund possible after delivery or by refusing the delivery")
         return r.done("Order in transit; customer advised to refuse delivery for an automatic refund.", 0.85)
     cat = o["items"][0]["category"]
-    window = RETURN_WINDOW.get(cat, 15)
+    window = return_window(cat, r.ctx.get("tier"))
     days = r.days_since(o["delivered_at"])
     if days > window:
         r.step("Check return window", "fail", f"{cat} return window is {window} days; delivered {days:.0f} days ago")
         return r.done("Outside the return window; not eligible for refund (warranty route explained).", 0.8)
     r.step("Check return window", "pass", f"{cat}: {window}-day window, delivered {days:.0f} day(s) ago")
-    if o["amount"] > AUTO_REFUND_LIMIT:
-        r.step("Check refund limit", "warn", f"{inr(o['amount'])} exceeds AI refund limit {inr(AUTO_REFUND_LIMIT)}")
+    limit = getattr(getattr(r.store, "policy", None), "auto_refund_limit", AUTO_REFUND_LIMIT)
+    if o["amount"] > limit:
+        r.step("Check refund limit", "warn", f"{inr(o['amount'])} exceeds AI refund limit {inr(limit)} — requesting human approval")
         r.act("generate_return_label", "Collect the item while Payments approves", protective=True, order_id=o["id"], reason="refund")
+        r.act("initiate_refund", "Eligible return; amount needs a human approver", approval=True, order_id=o["id"],
+              amount=o["amount"], reason="Customer return (approved by Payments)")
         return r.done("Eligible return, but refund amount needs Payments approval.", 0.66, resolvable=False)
     r.step("Check refund limit", "pass", f"{inr(o['amount'])} within AI refund limit")
     r.act("generate_return_label", "Return pickup", order_id=o["id"], reason="refund")
@@ -282,7 +299,7 @@ def _delivery_delay(r):
         r.step("Check courier health", "warn" if inc else "pass", inc["hypothesis"] if inc else f"No network-wide disruption at {o['courier']}")
         r.act("expedite_shipment", "Shipment past ETA", order_id=o["id"])
         r.act("issue_coupon", "Apology for the delay", customer_id=r.ctx["customer_id"],
-              amount=200 if r.ctx["tier"] == "Premium" else 100, reason=f"Delay on {o['id']}")
+              amount=DELAY_COUPON.get(r.ctx["tier"], DELAY_COUPON["default"]), reason=f"Delay on {o['id']}")
         return r.done(f"Shipment is {late:.0f} day(s) late; expediting with the courier and compensating.", 0.88)
     r.step("Compare with promised ETA", "pass", f"On track — ETA {fmt_ts(o['eta'])}")
     return r.done("Shipment on track.", 0.92)
@@ -313,7 +330,7 @@ def _return_request(r, o=None):
         r.step("Check return eligibility", "info", f"Order is '{o['status']}' — returns start after delivery")
         return r.done("Order not delivered yet.", 0.85)
     cat = o["items"][0]["category"]
-    window = RETURN_WINDOW.get(cat, 15)
+    window = return_window(cat, r.ctx.get("tier"))
     days = r.days_since(o["delivered_at"])
     if days > window:
         r.step("Check return window", "fail", f"{cat} window is {window} days; delivered {days:.0f} days ago")
@@ -328,8 +345,8 @@ def _login(r, reset_only=False):
     acct = r.store.get("accounts", r.ctx["customer_id"]) or {}
     status, attempts = acct.get("status", "active"), acct.get("failed_attempts", 0)
     r.step("Check account status", "pass" if status == "active" else "fail", f"Account status: {status.replace('_', ' ')}")
-    r.step("Check password attempts", "fail" if attempts >= 5 else "pass", f"{attempts} failed attempt(s) (lock threshold 5)")
-    locked = status == "locked" or attempts >= 5
+    r.step("Check password attempts", "fail" if attempts >= LOCK_THRESHOLD else "pass", f"{attempts} failed attempt(s) (lock threshold {LOCK_THRESHOLD})")
+    locked = status == "locked" or attempts >= LOCK_THRESHOLD
     r.step("Check lock status", "fail" if locked else "pass",
            f"Locked until {fmt_ts(acct.get('locked_until'))}" if locked and acct.get("locked_until") else ("Locked" if locked else "Not locked"))
     if status in ("security_hold", "suspended"):
@@ -338,7 +355,7 @@ def _login(r, reset_only=False):
     if locked:
         r.act("unlock_account", "Locked by failed password attempts", customer_id=r.ctx["customer_id"])
         r.act("reset_password", "Customer cannot remember password", customer_id=r.ctx["customer_id"])
-        return r.done("Account auto-locked after 5 failed password attempts; unlocking and sending a reset link.", 0.93)
+        return r.done(f"Account auto-locked after {LOCK_THRESHOLD} failed password attempts; unlocking and sending a reset link.", 0.93)
     r.act("reset_password", "Secure reset link", customer_id=r.ctx["customer_id"])
     return r.done("Account is healthy; a password reset link resolves forgotten credentials." if reset_only else
                   "Account healthy; likely forgotten password or stale app session — reset link sent, clear app cache.",

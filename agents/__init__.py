@@ -20,11 +20,16 @@ server, evaluation and tests.
 | +  | insights_agent            | Root Cause Discovery                   |
 | +  | channel_agent             | Omnichannel adapter                    |
 | +  | response_agent            | Sentiment-aware response composition   |
+
+Platform layer (Phase 1): ``workspace`` (tenant-scoped data access through the company adapter in
+``integrations/``), ``policy`` (action authorization), ``approvals`` (human-in-the-loop), ``audit``,
+``llm`` (single LLM gateway with fallback), ``runlog`` (tool/LLM call recording) and ``tenancy``
+(tenants + API keys). The HTTP API is ``api/server.py``.
 """
 
-from . import (action_agent, channel_agent, context_agent, escalation_agent, insights_agent, intent_agent, knowledge_agent,
-               memory_agent, orchestrator_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent,
-               troubleshooting_agent)
+from . import (action_agent, approvals, audit, channel_agent, context_agent, escalation_agent, insights_agent, intent_agent,
+               knowledge_agent, llm, memory_agent, orchestrator_agent, policy, response_agent, satisfaction_agent,
+               ticket_agent, tracking_agent, troubleshooting_agent)
 from .action_agent import ACTIONS, catalog as action_catalog, execute as execute_action
 from .channel_agent import SAMPLE_PAYLOADS, format_outbound, normalize_inbound
 from .context_agent import compact as compact_context, customer_context, resolve_customer_id
@@ -40,6 +45,7 @@ from .store import Store, get_store
 from .ticket_agent import render_markdown as render_ticket
 from .tracking_agent import OPEN_STATUSES, STATUS_FLOW, TRANSITIONS, sla_scan, sla_status, supervisor_metrics, transition
 from .troubleshooting_agent import investigate
+from .workspace import Workspace, as_workspace
 
 AGENTS = [
     ("1", "Conversation Understanding", "intent_agent", "Intent, category, priority, sentiment/emotion, entities"),
@@ -65,5 +71,6 @@ __all__ = [
     "execute_action", "expand_kb", "extract_entities", "fmt_ts", "format_outbound", "get_groq_api_key", "get_store",
     "handle_message", "inr", "investigate", "learned_thresholds", "llm_enabled", "load_kb", "normalize_inbound",
     "record_csat", "render_ticket", "resolve_customer_id", "review", "run_conversation", "search_kb", "select_workflow",
-    "sla_scan", "sla_status", "summarize_turn", "supervisor_metrics", "transition", "understand",
+    "sla_scan", "sla_status", "summarize_turn", "supervisor_metrics", "transition", "understand", "Workspace", "as_workspace",
+    "approvals", "audit", "llm", "policy",
 ]

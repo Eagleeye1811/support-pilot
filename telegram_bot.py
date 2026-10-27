@@ -434,6 +434,7 @@ if __name__ == "__main__":
     tok = get_token()
     if not tok:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env first (create a bot with @BotFather).")
-    b = TelegramBot(A.Store(), tok, use_llm=A.llm_enabled())
+    from agents.tenancy import DEMO_TENANT, get_registry
+    b = TelegramBot(get_registry().workspace(DEMO_TENANT), tok, use_llm=A.llm_enabled())
     print("SupportPilot Telegram bot running — press Ctrl+C to stop.")
     b.run()

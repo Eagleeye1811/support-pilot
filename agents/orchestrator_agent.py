@@ -1,21 +1,33 @@
-"""Agent 11: Master Orchestrator — Planner → Executor agents → Reviewer guardrail, with a full trace.
+"""Agent 11: Master Orchestrator — the workflow that coordinates every agent, with a persisted run record.
 
 One customer message flows through:
-  Channel adapter → Understand intent → Memory (slot filling / lifecycle) →
+  Channel adapter → Understand (rules + LLM) → Memory (slot filling / lifecycle) →
   Customer context → Knowledge retrieval → Troubleshooting → Escalation
-  (pre-action) → Action execution → Escalation (post-action) → Ticket →
-  Resolution tracking → Response (sentiment-aware) → CSAT → Reviewer.
+  (pre-action) → [customer confirmation, if the plan came from an LLM-only reading] →
+  Authorize + execute actions → Escalation (post-action) → Ticket (+ approvals) →
+  Resolution tracking → Response (LLM-written, fact-validated) → CSAT → Reviewer.
+
+Each run is stored in ``workflow_runs`` with its steps, every tool call against the
+company system, every LLM call (and whether the fallback was used) and the outcome.
+Company data is reached only through the tenant Workspace (``agents/workspace.py``).
 """
 from __future__ import annotations
 
 import re
 import time
 
-from . import (action_agent, channel_agent, context_agent, email_agent, escalation_agent, intent_agent, knowledge_agent, media,
-               memory_agent, response_agent, satisfaction_agent, ticket_agent, tracking_agent, troubleshooting_agent)
-from .shared_agent import ALWAYS_ESCALATE, AUTO_REFUND_LIMIT, CHANNELS, COMPANY, INTENTS
+from integrations.base import AdapterError
+
+from . import (action_agent, approvals, channel_agent, context_agent, email_agent, escalation_agent, intent_agent,
+               knowledge_agent, llm, media, memory_agent, response_agent, runlog, satisfaction_agent, ticket_agent,
+               tracking_agent, troubleshooting_agent)
+from .policy import SENSITIVE_ACTIONS
+from .shared_agent import ALWAYS_ESCALATE, AUTO_REFUND_LIMIT, CHANNELS, COMPANY, INTENTS, iso
+from .workspace import as_workspace
 
 PHOTO_INTENTS = {"wrong_item", "damaged_item", "return_request"}
+MAX_MESSAGE_CHARS = 4000
+ACTION_LABELS = {k: v[1] for k, v in action_agent.ACTIONS.items()}
 
 
 class Tracer:
@@ -37,15 +49,19 @@ class Tracer:
         self.steps.append(dict(agent=agent, status=status, ms=0.0, summary=summary))
 
 
-def review(reply, decision, actions, ticket, intent, ctx):
+def review(reply, decision, actions, ticket, intent, ctx, refund_limit=AUTO_REFUND_LIMIT, intent_source="rules",
+           confirmed=False):
     """Reviewer guardrail: verify the turn before anything reaches the customer."""
     checks = [
         ("Reply is non-empty", bool(reply and reply.strip())),
         ("Only successful actions are claimed",
          all(not a["message"] or a["message"] not in reply for a in actions if a["status"] in ("failed", "blocked"))),
         ("AI refunds within limit",
-         all(a["data"].get("amount", 0) <= AUTO_REFUND_LIMIT for a in actions
-             if a["action"] == "initiate_refund" and a["status"] == "success" and a["actor"] == "AI")),
+         all(a["data"].get("amount", 0) <= refund_limit for a in actions
+             if a["action"] == "initiate_refund" and a["status"] == "success" and a["actor"].startswith("AI"))),
+        ("No sensitive action on an unconfirmed LLM-only reading",
+         intent_source != "llm" or confirmed or
+         not any(a["action"] in SENSITIVE_ACTIONS and a["status"] == "success" for a in actions)),
         ("Escalation carries a complete ticket",
          decision != "escalate" or bool(ticket and ticket.get("conversation_summary") and ticket.get("team") and ticket.get("investigation") is not None)),
         ("Mandatory escalations honoured", intent not in ALWAYS_ESCALATE or decision == "escalate"),
@@ -63,47 +79,133 @@ def _issue_understanding(understanding, issue, mode):
     if understanding["intent"] == issue["intent"]:
         conf = max(conf, understanding["confidence"])
     return dict(understanding, intent=issue["intent"], category=issue["category"], confidence=conf,
-                priority=issue.get("priority", understanding["priority"]))
+                priority=issue.get("priority", understanding["priority"]), source=issue.get("source", understanding.get("source")))
+
+
+def _clean_text(text):
+    """Input validation: strip control characters and cap the length of a customer message."""
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(text or ""))
+    return text.strip()[:MAX_MESSAGE_CHARS]
+
+
+def _llm_summary(llm_calls, use_llm):
+    if not use_llm:
+        return dict(mode="off", reason="LLM switched off for this turn", calls=[])
+    if not llm_calls:
+        st = llm.status()
+        return dict(mode="fallback" if st["mode"] != "llm" else "not needed",
+                    reason=st["reason"] if st["mode"] != "llm" else "no LLM step needed for this turn", calls=[])
+    ok = [c for c in llm_calls if c.get("ok")]
+    bad = [c for c in llm_calls if not c.get("ok")]
+    mode = "llm" if ok and not bad else ("partial" if ok else "fallback")
+    reason = "; ".join(f"{c['purpose']}: {c.get('error')}" for c in bad) or "all LLM steps succeeded"
+    return dict(mode=mode, reason=reason, model=llm_calls[0].get("model"),
+                calls=[{k: c.get(k) for k in ("purpose", "ok", "error", "ms", "model")} for c in llm_calls])
 
 
 def handle_message(store, text=None, conversation_id=None, customer_id=None, channel="web", payload=None, use_llm=True,
                    contact_email=None, attachments=None, defer_csat=False):
-    """Process one inbound customer message end-to-end and return the full, traceable turn."""
+    """Process one inbound customer message end-to-end; the run is persisted in ``workflow_runs``."""
+    ws = as_workspace(store)
+    t0 = time.time()
+    run = dict(id=f"RUN-{ws.next_seq('run', 1):06d}", tenant=ws.tenant["id"], channel=channel, started_at=iso(),
+               status="running", adapter=ws.adapter.name, simulated=ws.adapter.simulated, conversation_id=conversation_id)
+    with runlog.recording() as rec:
+        try:
+            out = _handle(ws, run, text, conversation_id, customer_id, channel, payload, use_llm, contact_email,
+                          attachments, defer_csat)
+        except AdapterError as exc:  # the company system is down: say so honestly, change nothing
+            out = _degraded(ws, run, exc)
+        except Exception as exc:
+            run.update(status="failed", error=f"{type(exc).__name__}: {exc}"[:300], finished_at=iso(),
+                       ms=round((time.time() - t0) * 1000, 1), tool_calls=rec.tool_calls,
+                       llm=_llm_summary(rec.llm_calls, use_llm))
+            run.pop("_conv", None)
+            ws.put("workflow_runs", run["id"], run)
+            raise
+        out["llm"] = _llm_summary(rec.llm_calls, use_llm)
+        dec = out.get("decision")
+        run.pop("_conv", None)
+        run.update(status="degraded" if out.get("degraded") else "completed", finished_at=iso(),
+                   ms=round((time.time() - t0) * 1000, 1), conversation_id=out["conversation_id"],
+                   customer_id=(out.get("context") or {}).get("customer_id"), message=out.get("inbound", {}).get("text", "")[:500],
+                   intent=(out.get("issue") or out.get("understanding") or {}).get("intent"),
+                   intent_source=(out.get("understanding") or {}).get("source"),
+                   decision=dec["decision"] if isinstance(dec, dict) else dec, ticket_id=(out.get("ticket") or {}).get("id"),
+                   action_ids=[a["id"] for a in out.get("actions", [])],
+                   approval_ids=[a["data"]["approval_id"] for a in out.get("actions", []) if a["status"] == "pending_approval"],
+                   reply=(out.get("reply") or "")[:2000], review=out.get("review"), steps=out.get("trace", []),
+                   tool_calls=rec.tool_calls, llm=out["llm"], llm_calls=rec.llm_calls)
+        ws.put("workflow_runs", run["id"], run)
+    out["run_id"] = run["id"]
+    return out
+
+
+def _degraded(ws, run, exc):
+    conv = run.get("_conv")
+    reply = ("I'm sorry — I can't reach our order and account systems right now, so I can't check this safely. "
+             "Nothing has been changed on your account. Please try again in a few minutes.")
+    if conv:
+        memory_agent.add_message(conv, "assistant", reply, dict(decision="system_unavailable", run_id=run["id"]))
+        memory_agent.save(ws, conv)
+    return dict(conversation_id=(conv or {}).get("id") or run.get("conversation_id"), channel=run["channel"], reply=reply,
+                reply_channel=reply, decision="system_unavailable", degraded=True, error=str(exc), actions=[],
+                understanding=None, issue=None, context=None, ticket=None, review=None, trace=[], conversation=conv,
+                awaiting=None, inbound=dict(text=""), articles=[], attachments=[], llm_polished=False, email=None)
+
+
+def _confirm_question(issue, planned, ctx):
+    name = f", {ctx['first_name']}" if ctx and ctx.get("first_name") else ""
+    labels = [ACTION_LABELS.get(a["action"], a["action"]) + (f" for {a['params']['order_id']}" if a["params"].get("order_id") else "")
+              for a in planned if a["action"] != "notify_customer"]
+    return (f"Before I change anything{name}: I understood this as **{issue.get('label', label(issue['intent']))}**. "
+            "Here's what I'd do:\n" + "\n".join(f"- {x}" for x in labels) + "\n\nShall I go ahead? (yes / no)")
+
+
+def _handle(ws, run, text, conversation_id, customer_id, channel, payload, use_llm, contact_email, attachments, defer_csat):
+    store = ws
     T = Tracer()
-    plan = ["channel", "understand", "memory", "context", "knowledge", "troubleshoot", "escalate?", "act", "escalate",
+    plan = ["channel", "understand", "memory", "context", "knowledge", "troubleshoot", "escalate?", "authorize+act", "escalate",
             "ticket", "track", "respond", "csat", "review"]
-    T.note("Master Orchestrator (Planner)", "Plan: " + " → ".join(plan))
+    T.note("Master Orchestrator (Planner)", "Plan: " + " → ".join(plan) + f" · company system: {ws.adapter.name}"
+           + (" (simulated)" if ws.adapter.simulated else ""))
 
     inbound = T.run("0 Omnichannel Adapter",
                     lambda: channel_agent.normalize_inbound(channel, payload if payload is not None else {"text": text}),
                     lambda r: f"{CHANNELS.get(r['channel'], r['channel'])} · sender {r['sender'] or 'session'}")
-    text = inbound["text"]
+    text = inbound["text"] = _clean_text(inbound["text"])
     if not text:
         raise ValueError("Empty message")
     conv = memory_agent.load_conversation(store, conversation_id, customer_id or inbound["sender"].get("customer_id"), inbound["channel"])
+    run["_conv"], run["conversation_id"] = conv, conv["id"]
     conv["channel"] = inbound["channel"]
     if contact_email:  # an address the customer gave us: the Email agent sends ticket emails there
         conv["contact_email"] = contact_email
     attachments = list(attachments or [])
-    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"], attachments=attachments))
+    memory_agent.add_message(conv, "user", text, dict(channel=inbound["channel"], attachments=attachments, run_id=run["id"]))
     out = dict(conversation_id=conv["id"], channel=inbound["channel"], inbound=inbound, understanding=None, issue=None,
                mode=None, context=None, articles=[], workflow=None, investigation=None, actions=[], decision=None,
                pre_decision=None, ticket=None, review=None, llm_polished=False, email=None, attachments=attachments)
+    gate = dict(source="rules", confirmed=False)
 
-    def finish(reply, ctx=None, decision=None, ticket=None, intent=None, actions=()):
-        polished = False
-        if use_llm and decision in ("auto_resolve", "escalate"):
-            reply, polished = response_agent.polish(reply, (out.get("understanding") or {}).get("emotion", "calm"))
-        rv = T.run("Reviewer (guardrail)", lambda: review(reply, decision, list(actions), ticket, intent, ctx),
+    def finish(reply, ctx=None, decision=None, ticket=None, intent=None, actions=(), generated=False):
+        polished, note = False, None
+        if use_llm and not generated and decision in ("auto_resolve", "escalate", "clarify", "confirm"):
+            reply, polished, note = response_agent.generate(reply, (out.get("understanding") or {}).get("emotion", "calm"), decision)
+            T.note("Response Generation", ("LLM wrote the reply · " if polished else "deterministic reply · ") + (note or ""),
+                   status="OK")
+        rv = T.run("Reviewer (guardrail)", lambda: review(reply, decision, list(actions), ticket, intent, ctx,
+                                                          ws.policy.auto_refund_limit, gate["source"], gate["confirmed"]),
                    lambda r: "approved" if r["approved"] else "rejected: " + ", ".join(r["rejected"]))
         if not rv["approved"]:
             reply = ("I want to make sure this is handled correctly, so I've passed your request to a specialist who will "
                      "contact you shortly." + (f" Your reference is {ticket['id']}." if ticket else ""))
-        memory_agent.add_message(conv, "assistant", reply, dict(ticket_id=(ticket or {}).get("id"), decision=decision))
+        memory_agent.add_message(conv, "assistant", reply, dict(ticket_id=(ticket or {}).get("id"), decision=decision,
+                                                                run_id=run["id"]))
         memory_agent.save(store, conv)
         out.update(reply=reply, reply_channel=channel_agent.format_outbound(
             conv["channel"], reply, (ctx or {}).get("first_name"), (ticket or {}).get("id"),
-            (out.get("issue") or {}).get("label")), review=rv, trace=T.steps, llm_polished=polished,
+            (out.get("issue") or {}).get("label")), review=rv, trace=T.steps, llm_polished=polished or generated,
             awaiting=conv.get("awaiting"), conversation=conv)
         return out
 
@@ -127,14 +229,42 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
             out["csat"] = rec
             return finish(reply, ctx, decision="csat", ticket=t)
 
+    # ---- confirmation of actions planned from an LLM-only reading ----------------
+    confirmed_issue, pending = None, None
+    if conv.get("awaiting") == "confirm_actions":
+        pending = conv.pop("pending_confirmation", None) or {}
+        conv["awaiting"] = None
+        active = conv.get("active_issue")
+        answer = intent_agent.yes_no(text)
+        if active and active["id"] == pending.get("issue_id") and answer:
+            if answer == "deny":
+                memory_agent.set_status(active, "closed", "Customer declined the proposed actions")
+                T.note("6 Conversation Memory", "customer declined the proposed actions — nothing executed")
+                ctx = context_agent.customer_context(store, conv.get("customer_id"))
+                out.update(understanding=pending.get("understanding"), issue=active, mode="declined")
+                return finish("No problem — I haven't changed anything. Tell me what you'd like me to do instead, "
+                              "or ask for a human agent.", ctx, decision="declined")
+            active["customer_confirmed"] = True
+            confirmed_issue = active
+
     # ---- 1 understand + 6 memory ----------------------------------------------
-    understanding = T.run("1 Conversation Understanding", lambda: intent_agent.understand(text, use_llm),
-                          lambda r: f"{r['intent']} · {r['category']} · {r['priority']} · {r['emotion']} · conf {r['confidence']:.0%}")
-    out["understanding"] = understanding
-    conv["sentiment_trail"].append(understanding["emotion"])
-    issue, mode = T.run("6 Conversation Memory", lambda: memory_agent.track_issue(conv, understanding, text),
-                        lambda r: f"{r[1]} · issue {r[0]['intent'] if r[0] else '—'} · turn {len(conv['messages'])}")
-    out.update(issue=issue, mode=mode)
+    if confirmed_issue:
+        understanding = pending["understanding"]
+        issue, mode = confirmed_issue, "confirmed"
+        T.note("1 Conversation Understanding", f"customer confirmed: {issue['intent']} (understood earlier by {issue.get('source')})")
+        T.note("6 Conversation Memory", f"confirmed · issue {issue['intent']} · turn {len(conv['messages'])}")
+    else:
+        active = conv.get("active_issue")
+        understanding = T.run("1 Conversation Understanding",
+                              lambda: intent_agent.understand(text, use_llm, context=(active or {}).get("label")),
+                              lambda r: f"{r['intent']} · {r['category']} · {r['priority']} · {r['emotion']} · conf {r['confidence']:.0%}"
+                                        f" · by {r.get('source', 'rules')}" + (f" (LLM: {r['llm']['status']})" if r.get("llm", {}).get("status") not in (None, "off") else ""))
+        conv["sentiment_trail"].append(understanding["emotion"])
+        issue, mode = T.run("6 Conversation Memory", lambda: memory_agent.track_issue(conv, understanding, text),
+                            lambda r: f"{r[1]} · issue {r[0]['intent'] if r[0] else '—'} · turn {len(conv['messages'])}")
+        if issue and mode == "follow_up" and understanding.get("source") in ("rules", "rules+llm"):
+            issue["source"] = "rules+llm" if issue.get("source") == "llm" else issue.get("source", "rules")
+    out.update(understanding=understanding, issue=issue, mode=mode)
 
     # ---- 2 customer context ---------------------------------------------------
     ents = dict((issue or {}).get("slots", {}), **understanding["entities"])
@@ -150,7 +280,7 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     if mode == "meta" or (issue is None and intent_agent.is_conversational(intent)):
         if intent == "greeting":
             name = f", {ctx['first_name']}" if ctx else ""
-            return finish(f"Hi{name}! 👋 I'm the {COMPANY} support assistant. "
+            return finish(f"Hi{name}! 👋 I'm the {ws.tenant.get('name', COMPANY)} support assistant. "
                           "Tell me what's going on — orders, payments, refunds, login, subscriptions or your NovaFiber connection — "
                           "and I'll investigate and fix it.", ctx)
         if intent in ("thanks", "deny"):
@@ -168,11 +298,12 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
         if intent == "human_agent" and issue is None:
             issue = memory_agent.open_issue(conv, understanding, text)
             out.update(issue=issue, mode="new")
-    human_requested = intent == "human_agent"
+    human_requested = intent == "human_agent" or bool(understanding.get("wants_human"))
     if issue is None:
         issue = memory_agent.open_issue(conv, understanding, text)
         out.update(issue=issue, mode="new")
     iu = _issue_understanding(understanding, issue, mode)
+    gate.update(source=issue.get("source", iu.get("source", "rules")), confirmed=bool(issue.get("customer_confirmed")))
     memory_agent.set_status(issue, "investigating")
 
     # ---- 3 knowledge ----------------------------------------------------------------
@@ -199,14 +330,26 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
             investigation["confidence"] = round(min(0.99, investigation.get("confidence", 0) + 0.05), 2)
     out["investigation"] = investigation
 
-    # ---- 7 escalation (pre) → 5 actions → 7 escalation (post) ------------------------
+    # ---- 7 escalation (pre) → confirm? → 5 authorize + act → 7 escalation (post) -------------
     thresholds = satisfaction_agent.learned_thresholds(store)
+    thresholds.update(ws.policy.threshold_overrides)  # human-approved analytics recommendations take precedence
     pre = T.run("7 Escalation Decision (pre-action)", lambda: escalation_agent.decide(
         iu, investigation, ctx, issue, None, thresholds, human_requested, conv.get("clarification_count", 0)),
         lambda r: f"{r['decision']} · conf {r['confidence']:.0%} vs threshold {r['threshold']:.0%}")
     out["pre_decision"] = pre
-    planned = investigation["recommended_actions"] if pre["decision"] == "auto_resolve" else (
-        [a for a in investigation["recommended_actions"] if a.get("protective")] if pre["decision"] == "escalate" else [])
+    recommended = investigation["recommended_actions"]
+    planned = recommended if pre["decision"] == "auto_resolve" else (
+        [a for a in recommended if a.get("protective") or a.get("approval")] if pre["decision"] == "escalate" else [])
+    sensitive = [a for a in planned if a["action"] in SENSITIVE_ACTIONS]
+    if (sensitive and ws.policy.confirm_llm_only_actions and gate["source"] == "llm" and not gate["confirmed"]
+            and pre["decision"] == "auto_resolve"):
+        T.note("5 Action Execution", "held: " + ", ".join(a["action"] for a in sensitive)
+               + " planned from an LLM-only reading — asking the customer to confirm first")
+        conv["awaiting"] = "confirm_actions"
+        conv["pending_confirmation"] = dict(issue_id=issue["id"], understanding=iu, actions=[a["action"] for a in planned])
+        memory_agent.set_status(issue, "awaiting_customer", "Asked the customer to confirm the proposed actions")
+        out["decision"] = dict(pre, decision="confirm", reasons=["Sensitive action planned from an LLM-only reading"])
+        return finish(_confirm_question(issue, planned, ctx), ctx, decision="confirm", intent=issue["intent"])
     actions = []
     if planned:
         def run_actions():
@@ -240,6 +383,14 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     for a in actions:
         a["ticket_id"] = ticket["id"]
         store.put("actions", a["id"], a)
+    waiting = [a["data"]["approval_id"] for a in actions if a["status"] == "pending_approval"]
+    if waiting:
+        approvals.link_ticket(store, waiting, ticket["id"])
+        ticket["approvals"] = list(dict.fromkeys((ticket.get("approvals") or []) + waiting))
+        ticket["human_status"] = f"Needs {ticket.get('team')} approval ({', '.join(waiting)})"
+        ticket["recommended_next_step"] = (f"Review and approve or reject {', '.join(waiting)} in the Approvals queue; "
+                                           "on approval SupportPilot runs the action and notifies the customer.")
+        store.put("tickets", ticket["id"], ticket)
     if attachments:  # keep the customer's photos with the ticket for the human agent
         ticket["attachments"] = list(dict.fromkeys((ticket.get("attachments") or []) + attachments))
         store.put("tickets", ticket["id"], ticket)
@@ -260,17 +411,28 @@ def handle_message(store, text=None, conversation_id=None, customer_id=None, cha
     T.run("9 Resolution Tracking", track, lambda r: f"lifecycle {issue['status']} · SLA {r.get('state')}")
     out["ticket"] = ticket
 
-    reply = response_agent.compose(decision, iu, investigation, actions, ctx, ticket, issue, articles, conv["channel"])
+    kb_answer, generated = None, False
+    if issue["intent"] == "general_inquiry" and articles and use_llm and decision["decision"] == "auto_resolve":
+        kb_answer, note = response_agent.answer_from_kb(text, articles)
+        T.note("3 Knowledge Retrieval", note)
+    reply = response_agent.compose(decision, iu, investigation, actions, ctx, ticket, issue, articles, conv["channel"],
+                                   kb_answer=kb_answer)
+    if kb_answer:  # already written by the LLM from the articles and validated
+        generated = True
     if decision["decision"] == "auto_resolve":
         T.note("10 Customer Satisfaction", "CSAT requested")
-        if not defer_csat:  # guided flows ask for the rating themselves, after the email step
-            reply += "\n\n" + satisfaction_agent.CSAT_PROMPT
+    if use_llm and not generated:
+        reply, generated, note = response_agent.generate(reply, iu.get("emotion", "calm"), decision["decision"])
+        T.note("Response Generation", ("LLM wrote the reply · " if generated else "deterministic reply · ") + (note or ""))
+    if decision["decision"] == "auto_resolve" and not defer_csat:  # guided flows ask for the rating after the email step
+        reply += "\n\n" + satisfaction_agent.CSAT_PROMPT
     if conv.get("contact_email"):
         out["email"] = T.run("Email Agent", lambda: email_agent.send_email(
             store, conv["contact_email"], "ticket", ticket["id"], reply,
             images=media.ticket_images(store, issue["intent"], issue.get("slots")), customer_name=(ctx or {}).get("first_name")),
             lambda r: f"{r['status']} → {r['to_masked']}")
-    return finish(reply, ctx, decision=decision["decision"], ticket=ticket, intent=issue["intent"], actions=actions)
+    return finish(reply, ctx, decision=decision["decision"], ticket=ticket, intent=issue["intent"], actions=actions,
+                  generated=True)  # generation (LLM or deterministic) already happened above
 
 
 def run_conversation(store, messages, customer_id=None, channel="web", use_llm=False):
